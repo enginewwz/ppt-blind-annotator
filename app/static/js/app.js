@@ -388,6 +388,9 @@ const App = {
         OpLog.add("选择新目录");
       } catch (e) { this.showError("重选目录失败：" + e.message); }
     });
+    // 点击底部状态栏「目录：xxx」chip 同样可重选目录（复用标题栏 data 目录按钮）
+    document.getElementById("sb-fs").addEventListener("click", () =>
+      document.getElementById("btn-open-dir").click());
     document.getElementById("btn-export").addEventListener("click", () => this.exportAnnotations());
     document.getElementById("btn-import").addEventListener("click", () => this.importAnnotations());
     document.querySelectorAll("#activitybar button").forEach((b) =>

@@ -9,15 +9,17 @@
   --radius-sm: 4px;
   --radius: 6px;
   --radius-lg: 8px;
+  --radius-panel: 8px;                          /* 圆角矩形面板统一 R（侧栏/工具栏/页面衬底/dock） */
 
-  /* ---- 阴影 ---- */
-  --shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
-  --shadow-lg: 0 8px 40px rgba(0, 0, 0, 0.6);
+  /* ---- 阴影（扁平化：全部去除）---- */
+  --shadow: none;
+  --shadow-lg: none;
 
   /* ---- 背景 ---- */
   --bg-titlebar: #f3f4f6;                       /* 顶部标题栏 */
   --bg-activity: #ededf0;                       /* 左侧活动栏 */
-  --bg-sidebar: #f6f7f8;                        /* 侧栏 / 工具栏 / 卡片 */
+  --bg-sidebar: #f1f4f8;                        /* 样本卡 / 侧栏衬底：统一灰、略加蓝 */
+  --bg-panel: var(--bg-sidebar);                /* 圆角矩形面板统一灰 = 样本衬底，保持同步 */
   --bg-editor: #ffffff;                         /* 编辑器主区 / 输入框 / 弹层 */
   --bg-hover: rgba(0, 0, 0, 0.05);              /* 悬停高亮 */
   --bg-active: rgba(0, 122, 204, 0.12);         /* 选中 / 激活 */
@@ -30,8 +32,9 @@
   --fg-on-accent: #ffffff;                      /* 强调/状态按钮上的文字 */
   --img-bg: #ffffff;                            /* 幻灯片 / 大图查看底色 */
 
-  /* ---- 边框 ---- */
-  --border: #e1e4e8;
+  /* ---- 边框（随衬底变浅，对比度略减）---- */
+  --border: #e6e9ee;
+  --border-panel: #dde0e5;                      /* 圆角矩形面板的边框 */
 
   /* ---- 强调色 / 状态色 ---- */
   --accent: #007acc;                            /* 主强调（激活、选中、链接） */
@@ -54,7 +57,8 @@
     /* ---- 背景 ---- */
     --bg-titlebar: #2d2d30;
     --bg-activity: #333337;
-    --bg-sidebar: #252526;
+    --bg-sidebar: #262a31;
+    --bg-panel: var(--bg-sidebar);
     --bg-editor: #1e1e1e;
     --bg-hover: rgba(255, 255, 255, 0.06);
     --bg-active: rgba(0, 122, 204, 0.25);
@@ -64,7 +68,8 @@
     /* ---- 前景 / 边框 / 状态色 ---- */
     --fg: #d4d4d4;
     --fg-muted: #9d9d9d;
-    --border: #3a3d41;
+    --border: #3d4147;
+    --border-panel: #474b52;
     --brown: #c88f6b;   /* 深色下棕色点更亮以便辨认 */
   }
 }

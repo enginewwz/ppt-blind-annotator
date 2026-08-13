@@ -7,6 +7,7 @@ const Annotate = (() => {
 
   const PAD = 12;          // 画布内边距
   const GAP = 12;          // 卡片间距
+  const SCROLLBAR = 16;    // 竖向滚动条预留宽：避免出现竖向滚动条时横向溢出
   const MIN_W = 260;       // 卡片最小宽度（保证评分/排名按钮不折叠）
   const MIN_H = 260;       // 卡片最小高度
   const HEADER_H = 136;    // 卡片头部近似高度（名字+页码+评分+排名）
@@ -265,7 +266,8 @@ const Annotate = (() => {
     return c ? c.offsetWidth : 800;   // 用 offsetWidth（含滚动条），避免滚动条出现/消失导致抖动
   }
   function boardW() {
-    return Math.max(420, boardCW() - PAD * 2);
+    // offsetWidth 含竖向滚动条；再预留滚动条宽度，避免竖向滚动条出现时横向溢出
+    return Math.max(420, boardCW() - PAD * 2 - SCROLLBAR);
   }
   function aspectOf() {
     const v = versionAt(0);
@@ -895,7 +897,8 @@ const Annotate = (() => {
           App.savePrefs();
           syncToggle("auto-arrange", false);
         } else {
-          arrange();   // 未选中时单击：自动排一遍（保留大小）
+          // 未选中时单击：有列布局→按列排；自由模式→skyline 自动打包
+          if (st.colMode) autoArrange(); else arrange();
         }
       }, 250);
     });

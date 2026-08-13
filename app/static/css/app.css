@@ -32,28 +32,32 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 /* ---------- app layout ---------- */
 #app-root {
   display: grid;
-  grid-template-rows: 38px 1fr 24px;
+  grid-template-rows: 38px 1fr auto;
   height: 100vh;
 }
 
 /* titlebar + command center */
 #titlebar {
+  position: relative;
   display: flex; align-items: center; gap: 8px; padding: 0 10px;
-  background: var(--bg-titlebar); border-bottom: 1px solid var(--border);
+  background: var(--bg-editor); border-bottom: none;   /* 扁平化：白底无边框 */
   overflow: hidden; min-width: 0;
 }
 .command-center {
   display: flex; align-items: center; gap: 8px;
   background: var(--bg-editor); border: 1px solid var(--border);
   border-radius: var(--radius-lg); padding: 4px 10px; flex: 0 1 420px;
-  box-shadow: var(--shadow); min-width: 80px;
+  min-width: 80px; margin: 0 auto;   /* 搜索栏居中 */
 }
 .command-center .cc-logo { color: var(--accent); font-weight: 700; flex: none; }
 .command-center input {
   border: none; outline: none; background: transparent; color: var(--fg); width: 100%;
   font-size: 13px; min-width: 0;
 }
-.titlebar-actions { margin-left: auto; display: flex; gap: 6px; flex: none; }
+.titlebar-actions {
+  position: absolute; right: 10px; top: 0; height: 100%;
+  display: flex; align-items: center; gap: 6px; flex: none;   /* 移到右侧，让搜索栏真正居中 */
+}
 .titlebar-actions button {
   border: none; background: transparent; color: var(--fg-muted);
   border-radius: var(--radius); padding: 4px 8px; white-space: nowrap;
@@ -64,32 +68,30 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 #body { display: flex; min-height: 0; }
 #activitybar {
   width: 60px; display: flex; flex-direction: column; align-items: center; gap: 4px;
-  padding-top: 6px; background: var(--bg-activity); border-right: 1px solid var(--border);
+  padding-top: 6px; background: var(--bg-editor); border-right: none;   /* 扁平化：白底无边框 */
 }
-#activitybar button { font-size: 12px; width: 48px; height: 30px; border: none; background: transparent; color: var(--fg-muted); border-radius: var(--radius); }
+#activitybar button { font-size: 14px; font-weight: 600; width: 48px; height: 34px; border: none; background: transparent; color: var(--fg-muted); border-radius: var(--radius); }   /* 标注/数据/报告 字体加大 */
 #activitybar button:hover { background: var(--bg-hover); color: var(--fg); }
 #activitybar button.active { color: var(--accent); background: var(--bg-active); }
 #sidebar {
   width: 260px; min-width: 150px; display: flex; flex-direction: column;
-  background: var(--bg-sidebar);
+  background: var(--bg-panel); border-radius: var(--radius-panel);   /* 圆角矩形面板（统一灰） */
+  border: 1px solid var(--border-panel);
+  margin: 4px 0 4px 2px;   /* 顶部上移、更贴左侧、底部下延 */
 }
-/* 拖动分隔条：两侧竖线边框 + 中间三个竖点（VS Code 风格） */
+/* 拖动分隔条：白底无边框；悬停/拖动时显示一条主题色、两头圆的竖线 */
 #splitter {
   width: 7px; flex: none; cursor: col-resize; position: relative;
-  background: var(--bg-sidebar);
-  box-shadow: inset 1px 0 0 var(--border), inset -1px 0 0 var(--border);
+  background: var(--bg-editor);
 }
 #splitter::after {
-  content: ""; position: absolute; left: 50%; top: 50%;
-  width: 3px; height: 14px; transform: translate(-50%, -50%);
-  background-image: radial-gradient(circle, var(--fg-muted) 1.3px, transparent 1.3px);
-  background-size: 3px 5px; background-repeat: repeat-y; background-position: center top;
-}
-#splitter:hover, #splitter.dragging {
-  box-shadow: inset 1px 0 0 var(--accent), inset -1px 0 0 var(--accent);
+  content: ""; position: absolute; left: 50%; top: 8px; bottom: 8px;
+  width: 2px; transform: translateX(-50%);
+  background: transparent; border-radius: 999px;
+  transition: background 0.12s;
 }
 #splitter:hover::after, #splitter.dragging::after {
-  background-image: radial-gradient(circle, var(--accent) 1.3px, transparent 1.3px);
+  background: var(--accent);   /* 主题色圆头竖线 */
 }
 #sidebar-header {
   display: flex; justify-content: space-between; align-items: center;
@@ -97,7 +99,12 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
   letter-spacing: 0.4px; color: var(--fg-muted);
 }
 .list { flex: 1; overflow-y: auto; overflow-x: auto; padding: 4px 6px; }
-#editor { flex: 1; min-width: 0; background: var(--bg-editor); display: flex; flex-direction: column; }
+#editor {
+  flex: 1; min-width: 0; display: flex; flex-direction: column;
+  background: var(--bg-editor); border-radius: var(--radius-panel);
+  border: 1px solid var(--border-panel);
+  margin: 4px 8px 4px 0; overflow: hidden;   /* 顶部上移；右下页面：白底圆角衬底 + 深灰框；底部下延 */
+}
 #view { flex: 1; overflow: auto; }
 
 /* deck list rows */
@@ -121,26 +128,34 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 /* 完成状态过滤下拉 */
 #deck-filter-row { padding: 4px 8px; border-bottom: 1px solid var(--border); }
 #deck-filter {
-  width: 100%; padding: 3px 8px; font-size: 12px; color: var(--fg);
-  background: var(--bg-editor); border: 1px solid var(--border); border-radius: var(--radius);
+  width: 100%; padding: 3px 4px; font-size: 12px; color: var(--fg);
+  background: transparent; border: none;   /* 无衬底黑字 */
 }
-#deck-filter:focus { outline: 1px solid var(--accent); }
+#deck-filter:focus { outline: none; }
 
 /* annotate */
 #annotate { display: flex; flex-direction: column; height: 100%; }
 #annot-toolbar {
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px; row-gap: 4px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border); background: var(--bg-sidebar);
+  padding: 6px 12px; margin: 0; font-size: 12px;   /* 统一 12px，span（deck名/页码）与按钮一致 */
+  border-bottom: 1px solid var(--border-panel);   /* 与下方内容用一根横线分离（同数据页） */
+  background: var(--bg-panel);
+  border-radius: var(--radius-panel) var(--radius-panel) 0 0;   /* 顶部圆角跟随白框 */
 }
 #annot-toolbar button {
-  border: 1px solid var(--border); background: var(--bg-editor); color: var(--fg);
-  border-radius: var(--radius); padding: 4px 10px;
+  border: none; background: transparent; color: var(--fg);   /* 无衬底黑字 */
+  border-radius: var(--radius); padding: 4px 8px; font-size: 12px;
 }
+#annot-toolbar #annot-deck-name,
+#annot-toolbar #pg-indicator {
+  display: inline-flex; align-items: center; height: 22px; padding: 0 4px;   /* 与相邻按钮高度对齐 */
+}
+#annot-toolbar #annot-deck-name { color: var(--fg-muted); font-weight: 500; }   /* slide 名浅灰 */
 #annot-toolbar button:hover { background: var(--bg-hover); }
-#annot-toolbar button.toggle { color: var(--fg-muted); }
-#annot-toolbar button.toggle.on { background: var(--accent); color: var(--fg-on-accent); border-color: var(--accent); }
-#annot-toolbar button.toggle.on:hover { background: var(--accent); }
+#annot-toolbar button.toggle { color: var(--fg); }
+#annot-toolbar button.toggle.on { color: var(--accent); background: transparent; }
+#annot-toolbar button.toggle.on:hover { background: var(--bg-hover); }
+#annot-toolbar button.primary { background: var(--accent); color: var(--fg-on-accent); }   /* 提交保留主题色 */
 #annot-toolbar .sep { width: 1px; height: 18px; background: var(--border); }
 #annot-toolbar .spacer { flex: 1; }
 .switch { display: inline-flex; align-items: center; gap: 4px; color: var(--fg-muted); cursor: pointer; }
@@ -149,7 +164,7 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 #clear-menu {
   position: absolute; right: 0; top: calc(100% + 4px); z-index: 40;
   background: var(--bg-editor); border: 1px solid var(--border); border-radius: var(--radius);
-  box-shadow: var(--shadow); display: flex; flex-direction: column; min-width: 160px; overflow: hidden;
+  display: flex; flex-direction: column; min-width: 160px; overflow: hidden;
 }
 #clear-menu button {
   border: none; border-radius: 0; background: transparent; color: var(--fg);
@@ -158,22 +173,23 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 #clear-menu button + button { border-top: 1px solid var(--border); }
 #clear-menu button:hover { background: var(--bg-hover); }
 /* 布局分段选择器（每行 N 列，图标按钮） */
-.seg { display: inline-flex; border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.seg { display: inline-flex; background: var(--bg-editor); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }   /* 外层圆角矩形白底 */
 #layout-seg button {
   border: none; background: var(--bg-editor); color: var(--fg-muted);
   display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 0;   /* 去掉各按钮自身圆角，选中蓝块才是干净矩形（圆角只留外层） */
   padding: 4px 8px; font-size: 12px;
 }
 #layout-seg button svg { display: block; }
-#layout-seg button + button { border-left: 1px solid var(--border); }
-#layout-seg button.on { background: var(--accent); color: var(--fg-on-accent); }
+#layout-seg button + button { border-left: 1px solid var(--border-panel); }   /* 竖线分隔（更深、清晰） */
+#layout-seg button.on { background: var(--accent); color: var(--fg-on-accent); }   /* 选中：主题色底白字 */
 
 #columns { flex: 1; position: relative; overflow: auto; }
 #board { position: relative; width: 100%; min-height: 100%; }
 .col {
   position: absolute; background: var(--bg-sidebar);
   border: 1px solid var(--border); border-radius: var(--radius-lg);
-  display: flex; flex-direction: column; box-shadow: var(--shadow);
+  display: flex; flex-direction: column;
 }
 .col-name-row { display: flex; align-items: center; gap: 6px; }
 .col-name { flex: 1; }
@@ -200,8 +216,8 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 .rh-sw { bottom: -6px; left: -6px; cursor: nesw-resize; }
 .rh-s  { bottom: -6px; left: 50%; margin-left: -6px; cursor: ns-resize; }
 .rh-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
-.col.ranked-best { border-color: var(--ok); box-shadow: 0 0 0 1px var(--ok); }
-.col.ranked-worst { border-color: var(--err); box-shadow: 0 0 0 1px var(--err); }
+.col.ranked-best { border-color: var(--ok); }
+.col.ranked-worst { border-color: var(--err); }
 .col-head { padding: 6px 8px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
 .col-name { font-weight: 600; }
 .col-page { font-size: 11px; text-align: center; }
@@ -234,24 +250,29 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 #datasets .ds-toolbar {
   position: sticky; top: 0; z-index: 10;
   display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
-  padding: 6px 16px;
-  border-bottom: 1px solid var(--border); background: var(--bg-sidebar);
+  padding: 6px 12px; font-size: 12px;   /* 与标注工具栏一致：统一 12px、左对齐、间距统一 */
+  border-bottom: 1px solid var(--border-panel); background: var(--bg-panel);
 }
 #datasets .ds-toolbar .sep { width: 1px; height: 18px; background: var(--border); }
 /* 数据页正文控制条：纵轴下拉 + 状态多选下拉 + 刷新 */
 .ds-ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); }
-.ds-ctl select {
-  appearance: none; padding: 4px 8px; border: 1px solid var(--border);
-  border-radius: var(--radius); background: var(--bg-editor); color: var(--fg);
-  font-size: 12px; cursor: pointer;
+.ds-ctl .sel-wrap { position: relative; display: inline-flex; align-items: center; transform: translateY(1px); }   /* 整体下移对齐 */
+.ds-ctl .sel-wrap::after {
+  content: "▾"; position: absolute; right: 4px; pointer-events: none;
+  font-size: 10px; color: var(--fg-muted);   /* 右侧倒三角 */
 }
-.ds-ctl select:focus, .ds-ctl select:hover { border-color: var(--accent); }
+.ds-ctl select {
+  appearance: none; border: none; background: transparent; color: var(--fg);
+  font-size: 12px; cursor: pointer; padding: 4px 16px 4px 4px;   /* 与相邻按钮同 padding，文字自然居中、不再偏高 */
+}
+.ds-ctl select:hover { color: var(--accent); }
 .ms-wrap { position: relative; }
 .ms-btn {
-  padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--radius);
-  background: var(--bg-editor); color: var(--fg); font-size: 12px;
+  padding: 4px 6px; border: none; background: transparent; color: var(--fg);
+  font-size: 12px; display: inline-flex; align-items: center; gap: 4px;
 }
-.ms-btn:hover { border-color: var(--accent); color: var(--accent); }
+.ms-btn::after { content: "▾"; font-size: 10px; color: var(--fg-muted); }   /* 右侧倒三角 */
+.ms-btn:hover { color: var(--accent); }
 .ms-panel {
   position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
   min-width: 150px; padding: 6px; background: var(--bg-sidebar);
@@ -264,10 +285,10 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 }
 .ms-panel label:hover { background: var(--bg-hover); }
 #ds-refresh {
-  margin-left: auto; padding: 4px 10px; border: 1px solid var(--border);
-  border-radius: var(--radius); background: var(--bg-editor); color: var(--fg); font-size: 12px;
+  margin-left: auto; padding: 4px 6px; border: none;
+  background: transparent; color: var(--fg); font-size: 12px;   /* 无衬底黑字，自然高度 */
 }
-#ds-refresh:hover { border-color: var(--accent); color: var(--accent); }
+#ds-refresh:hover { color: var(--accent); }
 #ds-content { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; }
 .ds-scroll { overflow: auto; min-width: 0; }
 .ds-table-wrap {
@@ -293,22 +314,34 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 .ds-item:hover { background: var(--bg-hover); }
 .ds-item.rm { background: var(--bg-err-soft); }
 .ds-item.add { background: var(--bg-ok-soft); }
-.ds-item input { accent-color: var(--accent); margin: 0; }
+.ds-item input { display: none; }   /* 隐藏勾选框；整行可点（label 仍会切换选中） */
 .ds-side-btns { padding: 8px 10px; border-top: 1px solid var(--border); }
 .ds-side-btns button {
-  width: 100%; border: 1px solid var(--border); background: var(--bg-editor); color: var(--fg);
+  width: 100%; border: none; background: transparent; color: var(--fg);   /* 无衬底黑字 */
   border-radius: var(--radius); padding: 6px 8px; font-size: 12px;
 }
-.ds-side-btns button.primary { background: var(--accent); color: var(--fg-on-accent); border-color: var(--accent); }
+.ds-side-btns button.primary { background: var(--accent); color: var(--fg-on-accent); }   /* 提交保留主题色 */
 .ds-side-btns button:disabled { opacity: 0.5; cursor: default; }
 
 /* statusbar */
 #statusbar {
-  display: flex; align-items: center; gap: 16px; padding: 0 10px;
-  background: var(--accent); color: var(--fg-on-accent); font-size: 12px;
+  display: flex; align-items: center; gap: 10px;
+  height: 26px; margin: 0 8px 4px; padding: 0 10px;   /* 整体下移 */
+  background: var(--bg-editor);   /* 白底 */
+  color: var(--fg); font-size: 12px;
+  border-radius: var(--radius-panel);
 }
+#statusbar span { font-size: 12px; line-height: 22px; }   /* 文字大小统一、行高与 chip 一致，防上翘 */
+#statusbar #sb-fs {
+  order: -1; background: var(--accent); color: var(--fg-on-accent);
+  border-radius: var(--radius);            /* R 与其它小控件统一（更小） */
+  height: 22px; line-height: 22px; padding: 0 8px;   /* 更窄、更高 */
+  white-space: nowrap; cursor: pointer;
+}
+#statusbar #sb-fs:hover { filter: brightness(1.1); }   /* 可点击提示 */
+#statusbar #sb-deck { background: transparent; }   /* deck 名白底、正常文字 */
 #statusbar .right { margin-left: auto; }
-#statusbar .muted { color: var(--statusbar-muted); }
+#statusbar .muted { color: var(--fg-muted); }   /* 白底上用灰色次要文字 */
 
 /* overlay */
 #overlay {
