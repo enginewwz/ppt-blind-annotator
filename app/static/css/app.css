@@ -72,12 +72,12 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 }
 #activitybar button { font-size: 14px; font-weight: 600; width: 48px; height: 34px; border: none; background: transparent; color: var(--fg-muted); border-radius: var(--radius); }   /* 标注/数据/报告 字体加大 */
 #activitybar button:hover { background: var(--bg-hover); color: var(--fg); }
-#activitybar button.active { color: var(--accent); background: var(--bg-active); }
+#activitybar button.active { color: var(--fg); background: var(--bg-active); }   /* 与 deck 目录选中一致：主题色淡底 + 深色文字 */
 #sidebar {
   width: 260px; min-width: 150px; display: flex; flex-direction: column;
   background: var(--bg-panel); border-radius: var(--radius-panel);   /* 圆角矩形面板（统一灰） */
   border: 1px solid var(--border-panel);
-  margin: 4px 0 4px 2px;   /* 顶部上移、更贴左侧、底部下延 */
+  margin: 2px 0 4px 2px;   /* 顶部上移，缩小与搜索栏间距 */
 }
 /* 拖动分隔条：白底无边框；悬停/拖动时显示一条主题色、两头圆的竖线 */
 #splitter {
@@ -103,7 +103,7 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
   flex: 1; min-width: 0; display: flex; flex-direction: column;
   background: var(--bg-editor); border-radius: var(--radius-panel);
   border: 1px solid var(--border-panel);
-  margin: 4px 8px 4px 0; overflow: hidden;   /* 顶部上移；右下页面：白底圆角衬底 + 深灰框；底部下延 */
+  margin: 2px 6px 4px 0; overflow: hidden;   /* 顶部上移，缩小与搜索栏间距 */
 }
 #view { flex: 1; overflow: auto; }
 
@@ -194,7 +194,6 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 .col-name-row { display: flex; align-items: center; gap: 6px; }
 .col-name { flex: 1; }
 .col.moving { opacity: 0.6; }
-.col.selected { outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent); }
 .col-move {
   flex: none; width: 14px; height: 14px; cursor: move;
   background-image: radial-gradient(circle, var(--fg-muted) 1.2px, transparent 1.2px);
@@ -218,22 +217,22 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 .rh-se { bottom: -6px; right: -6px; cursor: nwse-resize; }
 .col.ranked-best { border-color: var(--ok); }
 .col.ranked-worst { border-color: var(--err); }
+.col.selected { border-color: var(--accent); }   /* 选中主题色优先于最好/最差圈 */
 .col-head { padding: 6px 8px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 6px; }
 .col-name { font-weight: 600; }
 .col-page { font-size: 11px; text-align: center; }
-.scores { display: flex; gap: 4px; }
-.scores button {
-  flex: 1; border: 1px solid var(--border); background: var(--bg-editor); color: var(--fg);
-  border-radius: var(--radius-sm); padding: 2px 0;
+.scores, .ranks {
+  display: inline-flex; border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden; background: var(--bg-editor);
 }
-.scores button.on { background: var(--accent); color: var(--fg-on-accent); border-color: var(--accent); }
-.ranks { display: flex; gap: 4px; }
-.ranks button {
-  flex: 1; border: 1px solid var(--border); background: var(--bg-editor); color: var(--fg-muted);
-  border-radius: var(--radius-sm); padding: 2px 0; font-size: 12px;
+.scores button, .ranks button {
+  flex: 1; border: none; background: transparent; color: var(--fg);
+  padding: 2px 0; font-size: 12px;
 }
-.ranks .best.on { background: var(--ok); color: var(--fg-on-accent); border-color: var(--ok); }
-.ranks .worst.on { background: var(--err); color: var(--fg-on-accent); border-color: var(--err); }
+.scores button + button, .ranks button + button { border-left: 1px solid var(--border-panel); }
+.scores button.on { background: var(--accent); color: var(--fg-on-accent); }
+.ranks .best.on { background: var(--ok); color: var(--fg-on-accent); }
+.ranks .worst.on { background: var(--err); color: var(--fg-on-accent); }
 .col-body {
   flex: 1; display: flex; align-items: center; justify-content: center;
   padding: 8px; min-height: 0; overflow: hidden;
@@ -326,7 +325,7 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 /* statusbar */
 #statusbar {
   display: flex; align-items: center; gap: 10px;
-  height: 26px; margin: 0 8px 4px; padding: 0 10px;   /* 整体下移 */
+  height: 26px; margin: 0 6px 4px; padding: 0 10px;   /* 左右间距 6px ≤ 分隔条宽 7px */
   background: var(--bg-editor);   /* 白底 */
   color: var(--fg); font-size: 12px;
   border-radius: var(--radius-panel);
