@@ -1,0 +1,922 @@
+/* 标注视图：自由排布卡片（移动 / 八向缩放 / 可重叠联动），同步·独立翻页、乱序盲测、打分（排名+评分）、2s 防抖保存。 */
+const Annotate = (() => {
+  let st = null;      // 当前标注状态
+  let timer = null;
+  let spaceDown = false;   // 空格+滚轮 → 滚动卡片流
+  let dirty = false;       // 是否有未保存改动
+
+  const PAD = 12;          // 画布内边距
+  const GAP = 12;          // 卡片间距
+  const MIN_W = 260;       // 卡片最小宽度（保证评分/排名按钮不折叠）
+  const MIN_H = 260;       // 卡片最小高度
+  const HEADER_H = 136;    // 卡片头部近似高度（名字+页码+评分+排名）
+  const FULL_RATIO = 0.5;  // 显示宽度/原图宽度 > 此值 → 用原图（另：超过缩略图原始大小也用原图）
+
+  function shuffled(arr) {
+    const a = arr.slice();
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+
+  function openDeck(deck, opts) {
+    const sameDeck = !!(st && st.deck && st.deck.id === deck.id);
+    const noShuffle = !!(opts && opts.noShuffle);
+    // 保留上一个 Deck 的布局样式（列数/按列模式/卡片位置与大小），切到不同 Deck 沿用
+    const prevLayout = st ? {
+      cols: st.cols, colMode: st.colMode, boxes: st.boxes, _lastW: st._lastW,
+    } : null;
+    close();
+    const versions = deck.versions || [];
+    const keepLayout = !!(prevLayout && prevLayout.boxes &&
+      prevLayout.boxes.length === versions.length);
+    st = {
+      deck,
+      baseOrder: versions.map((_, i) => i),
+      order: versions.map((_, i) => i),
+      page: versions.map(() => 0),
+      sync: !!App.state.prefs.sync_page,
+      best: null,
+      worst: null,
+      scores: {},
+      status: "draft",
+      lastWheel: versions.map(() => 0),
+      cols: keepLayout ? prevLayout.cols : (App.state.prefs.cols || 4),
+      colMode: keepLayout ? prevLayout.colMode : true,
+      overlap: !!App.state.prefs.overlap,
+      auto: !!App.state.prefs.auto,
+      boxes: keepLayout ? prevLayout.boxes.map((b) => (b ? { ...b } : null)) : versions.map(() => null),
+      selected: null,
+      _lastW: keepLayout ? prevLayout._lastW : 0,
+      effCols: 0,
+    };
+    // 切换到「不同」的 Deck 时乱序；重选当前 Deck / 搜索 Enter 不重新乱序
+    if (!sameDeck && !noShuffle && App.state.prefs.shuffle) {
+      st.order = shuffled(st.baseOrder);
+    }
+    dirty = false;
+    const ann = App.state.annotations[deck.id];
+    if (ann) {
+      st.best = ann.best ?? null;
+      st.worst = ann.worst ?? null;
+      st.scores = Object.assign({}, ann.scores || {});
+      st.status = ann.status || "draft";
+    }
+    document.getElementById("annot-deck-name").textContent = deck.name;
+    syncToggle("sync-page", st.sync);
+    syncToggle("shuffle", !!App.state.prefs.shuffle);
+    syncToggle("overlap", st.overlap);
+    syncToggle("auto-arrange", st.auto);
+    document.getElementById("annot-saved").textContent = "";
+    App.statusBarDeck(deck);
+    renderColumns(keepLayout);
+    updateImages();
+    renderPageNav();
+  }
+
+  function close() {
+    flush();   // 切换/关闭前保存当前草稿（只在有改动时落盘）
+    if (timer) clearTimeout(timer);
+    st = null;
+    const b = document.getElementById("board");
+    if (b) b.innerHTML = "";
+  }
+
+  function totalPages() { return st && st.deck.page_count ? st.deck.page_count : 1; }
+  function curPage(i) { return st.sync ? (st.page[0] || 0) : (st.page[i] || 0); }
+
+  function setPage(delta, col) {
+    if (!st) return;
+    if (st.sync) {
+      const maxP = totalPages();               // 最长的 PPT 页数（同步以它为准）
+      const cur = st.page[0] || 0;
+      if (delta > 0 && cur >= maxP - 1) { scrollBoard(1); return; }   // 最后一个也翻完 → 整体下翻
+      if (delta < 0 && cur <= 0) { scrollBoard(-1); return; }         // 全部到第一页 → 整体上翻
+      const np = Math.min(Math.max(cur + delta, 0), maxP - 1);
+      st.page = st.page.map(() => np);         // 页数不同的 PPT 各自钳制在最后一页
+    } else {
+      const cur = st.page[col] || 0;
+      const v = versionAt(col);
+      const max = v && v.pages && v.pages.length ? v.pages.length - 1 : 0;
+      if (delta > 0 && cur >= max) { scrollBoard(1); return; }   // 该 PPT 翻到底 → 全局下翻
+      if (delta < 0 && cur <= 0) { scrollBoard(-1); return; }    // 翻到第一页 → 全局上翻
+      st.page[col] = cur + delta;
+    }
+    updateImages();
+    renderPageNav();
+  }
+
+  /* 页首/页尾之后，整体上下滚动卡片流（翻一屏） */
+  function scrollBoard(dir) {
+    const c = document.getElementById("columns");
+    if (!c) return;
+    const vh = Math.max(200, c.clientHeight);
+    c.scrollBy({ top: dir * vh * 0.85, behavior: "smooth" });
+  }
+
+  /* 滚轮翻页：同步模式整组联动，独立模式只翻当前列；250ms 节流防止触控板惯性连翻 */
+  function onWheel(e, col) {
+    if (!st) return;
+    if (spaceDown) return;   // 空格+滚轮：交给原生滚动（不翻页）
+    e.preventDefault();
+    const i = Number(col.dataset.idx);
+    const now = performance.now();
+    if (now - (st.lastWheel[i] || 0) < 250) return;
+    st.lastWheel[i] = now;
+    setPage(e.deltaY > 0 ? 1 : -1, i);
+  }
+
+  function renderPageNav() {
+    const p = (st.page[0] || 0) + 1;
+    const t = totalPages();
+    document.getElementById("pg-indicator").textContent = st.sync ? `${p} / ${t}` : "独立翻页";
+    updatePageBadges();
+  }
+
+  /* 每列头部显示当前页 / 总页数（独立翻页时尤其有用） */
+  function updatePageBadges() {
+    document.querySelectorAll("#columns .col").forEach((col) => {
+      const i = Number(col.dataset.idx);
+      const v = versionAt(i);
+      const el = col.querySelector(".col-page");
+      if (!el) return;
+      if (v && v.status === "ready" && v.pages && v.pages.length) {
+        el.textContent = `${Math.min(curPage(i), v.pages.length - 1) + 1} / ${v.page_count} 页`;
+      } else {
+        el.textContent = "";
+      }
+    });
+  }
+
+  function versionAt(i) { return st.deck.versions[st.order[i]]; }
+
+  function renderColumns(preserveBoxes) {
+    const board = document.getElementById("board");
+    board.innerHTML = "";
+    if (!st || !st.deck.versions.length) {
+      board.innerHTML = '<div class="empty muted">该 Deck 没有可用版本。</div>';
+      return;
+    }
+    st.order.forEach((oi, i) => {
+      const v = st.deck.versions[oi];
+      const col = document.createElement("div");
+      col.className = "col";
+      col.dataset.idx = String(i);
+      col.dataset.dsid = String(v.dataset_id);
+
+      const head = document.createElement("div");
+      head.className = "col-head";
+
+      const move = document.createElement("span");
+      move.className = "col-move";
+      move.title = "拖动移动框体";
+
+      const name = document.createElement("span");
+      name.className = "col-name";
+      name.textContent = `样本 ${i + 1}`;   // 盲测：不显示来源
+      const meta = document.createElement("span");
+      meta.className = "col-meta muted";
+      meta.textContent = v.status === "ready" ? `${v.page_count} 页` : v.status;
+      const pageBadge = document.createElement("span");
+      pageBadge.className = "col-page muted";
+
+      const nameRow = document.createElement("div");
+      nameRow.className = "col-name-row";
+      nameRow.appendChild(move);
+      nameRow.appendChild(name);
+      nameRow.appendChild(meta);
+
+      const scores = document.createElement("div");
+      scores.className = "scores";
+      for (let s = 1; s <= 5; s++) {
+        const b = document.createElement("button");
+        b.className = "score";
+        b.textContent = s;
+        b.dataset.action = "score";
+        b.dataset.val = String(s);
+        scores.appendChild(b);
+      }
+      const ranks = document.createElement("div");
+      ranks.className = "ranks";
+      const bBest = document.createElement("button");
+      bBest.className = "rank best";
+      bBest.textContent = "最好";
+      bBest.dataset.action = "best";
+      const bWorst = document.createElement("button");
+      bWorst.className = "rank worst";
+      bWorst.textContent = "最差";
+      bWorst.dataset.action = "worst";
+      ranks.appendChild(bBest);
+      ranks.appendChild(bWorst);
+
+      head.appendChild(nameRow);
+      head.appendChild(pageBadge);
+      head.appendChild(scores);
+      head.appendChild(ranks);
+
+      const body = document.createElement("div");
+      body.className = "col-body";
+      body.title = "滚轮翻页" + (st.sync ? "（同步）" : "（本列独立）");
+      const img = document.createElement("img");
+      img.className = "slide";
+      img.loading = "lazy";
+      img.decoding = "async";
+      img.alt = `样本 ${i + 1}`;
+      img.addEventListener("load", () => refreshSrc(img));   // 缩略图加载后按原始大小重新判断
+      body.appendChild(img);
+      body.addEventListener("wheel", (e) => onWheel(e, col), { passive: false });
+
+      col.appendChild(head);
+      col.appendChild(body);
+
+      ["nw", "n", "ne", "w", "e", "sw", "s", "se"].forEach((dir) => {
+        const h = document.createElement("div");
+        h.className = "rh rh-" + dir;
+        h.title = "拖动缩放";
+        h.addEventListener("mousedown", (e) => startResize(e, i, dir));
+        col.appendChild(h);
+      });
+
+      move.addEventListener("mousedown", (e) => startMove(e, i));
+      head.addEventListener("mousedown", (e) => {
+        if (e.target.closest("button") || e.target.closest(".rh")) return;
+        startMove(e, i);
+      });
+
+      board.appendChild(col);
+    });
+    refreshColButtonsAll();
+    refreshAllBorders();
+    if (preserveBoxes) applyBoxes();   // 乱序/重排时保留卡片位置与大小
+    else autoArrange();                // 首次打开：按列排布
+    syncLayoutSeg();
+  }
+
+  /* ---------- 排布 / 移动 / 缩放 / 重叠联动 ---------- */
+  function boardCW() {
+    const c = document.getElementById("columns");
+    return c ? c.offsetWidth : 800;   // 用 offsetWidth（含滚动条），避免滚动条出现/消失导致抖动
+  }
+  function boardW() {
+    return Math.max(420, boardCW() - PAD * 2);
+  }
+  function aspectOf() {
+    const v = versionAt(0);
+    const pg = v && v.pages && v.pages[0];
+    return pg && pg.w && pg.h ? pg.w / pg.h : 4 / 3;
+  }
+
+  /* 按列排布：每行 st.cols 列，卡片高度跟随 PPT 宽高比（拉伸/压缩填满，过小换行） */
+  function autoArrange() {
+    if (!st) return;
+    const W = boardW();
+    st._lastW = W;
+    const aspect = aspectOf();
+    const want = Math.max(1, Math.min(st.cols, st.boxes.length));
+    const fit = Math.max(1, Math.floor((W + GAP) / (MIN_W + GAP)));
+    // 迟滞：避免在列数边界来回跳（4↔3 抖动）
+    let cols = st.effCols || want;
+    if (cols < want && fit >= cols + 1) cols = Math.min(want, cols + 1);
+    if (cols > want) cols = want;
+    if (cols > fit) cols = Math.max(1, fit);
+    st.effCols = cols;
+    const w = Math.max(MIN_W, (W - GAP * (cols - 1)) / cols);
+    const h = HEADER_H + w / aspect;
+    st.boxes = st.boxes.map((_, i) => {
+      const r = Math.floor(i / cols), c = i % cols;
+      return { x: PAD + c * (w + GAP), y: PAD + r * (h + GAP), w: Math.round(w), h: Math.round(h) };
+    });
+    applyBoxes();
+  }
+
+  /* 保留大小，按左上角(y,x)排序后用 skyline 打包：优先上方、其次左方；
+     大框可占左侧，小框在右侧竖向堆叠（间距由占位宽度 w+GAP 保留） */
+  function arrange() {
+    if (!st) return;
+    const right = boardW() + PAD;   // 内容右边界（绝对坐标）
+    st._lastW = boardW();
+    const idxs = st.boxes.map((_, i) => i).sort((a, b) => {
+      const A = st.boxes[a], B = st.boxes[b];
+      return (A.y - B.y) || (A.x - B.x);
+    });
+    const out = st.boxes.map((b) => ({ ...b }));
+    let sky = [{ x: PAD, y: PAD, w: right - PAD }];
+    idxs.forEach((idx) => {
+      const b = out[idx];
+      const pw = b.w + GAP, ph = b.h + GAP;   // 占位尺寸（含间距）
+      let best = null;
+      for (let si = 0; si < sky.length; si++) {
+        let runW = 0, runY = 0;
+        for (let sj = si; sj < sky.length; sj++) {
+          runW += sky[sj].w;
+          runY = Math.max(runY, sky[sj].y);
+          if (runW >= b.w) {
+            const cand = { x: sky[si].x, y: runY };
+            if (!best || cand.y < best.y || (cand.y === best.y && cand.x < best.x)) best = cand;
+            break;
+          }
+        }
+      }
+      if (!best) {   // 无处可放 → 底部新行
+        const bottom = Math.max(...sky.map((s) => s.y));
+        best = { x: PAD, y: bottom };
+        sky = [{ x: PAD, y: bottom, w: right - PAD }];
+      }
+      b.x = best.x; b.y = best.y;
+      const placedTop = best.y + ph;
+      const segEnd = best.x + pw;
+      const newSky = [];
+      for (const seg of sky) {
+        const sEnd = seg.x + seg.w;
+        if (sEnd <= best.x || seg.x >= segEnd) { newSky.push(seg); continue; }
+        if (seg.x < best.x) newSky.push({ x: seg.x, y: seg.y, w: best.x - seg.x });
+        const a = Math.max(seg.x, best.x);
+        const z = Math.min(sEnd, segEnd);
+        if (a < z) newSky.push({ x: a, y: placedTop, w: z - a });
+        if (sEnd > segEnd) newSky.push({ x: segEnd, y: seg.y, w: sEnd - segEnd });
+      }
+      newSky.sort((p, q) => p.x - q.x);
+      sky = [];
+      for (const seg of newSky) {
+        const last = sky[sky.length - 1];
+        if (last && last.x + last.w === seg.x && last.y === seg.y) last.w += seg.w;
+        else sky.push({ ...seg });
+      }
+    });
+    st.boxes = out;
+    settleAll();          // 兜底：无论输入怎样都保证最终零重叠
+    applyBoxes();
+  }
+
+  function anyOverlap() {
+    for (let j = 0; j < st.boxes.length; j++) {
+      for (let k = j + 1; k < st.boxes.length; k++) {
+        if (overlapBoxes(st.boxes[j], st.boxes[k])) return true;
+      }
+    }
+    return false;
+  }
+
+  /* 全局去重叠：先贪心推开；若极端多卡仍重叠，则按 y 排序纵向堆叠兜底，保证零重叠 */
+  function settleAll() {
+    if (!st) return;
+    for (let pass = 0; pass < 24; pass++) {
+      let changed = false;
+      for (let j = 0; j < st.boxes.length; j++) {
+        for (let k = j + 1; k < st.boxes.length; k++) {
+          if (overlapBoxes(st.boxes[j], st.boxes[k])) {
+            pushOut(st.boxes[j], st.boxes[k]);
+            changed = true;
+          }
+        }
+      }
+      if (!changed) break;
+    }
+    st.boxes.forEach(clampBox);
+    if (anyOverlap()) {
+      const idxs = st.boxes.map((_, i) => i).sort((a, b) => st.boxes[a].y - st.boxes[b].y);
+      let y = PAD;
+      idxs.forEach((idx) => {
+        st.boxes[idx].y = y;
+        y += st.boxes[idx].h + GAP;
+      });
+      st.boxes.forEach(clampBox);
+    }
+  }
+
+  /* 视口变化（侧栏拖宽/窗口缩放）：按列模式→重新按列填满；自由模式→按宽度等比拉伸/压缩，
+     过小换行；允许重叠时只保证不越界、必要时重叠。绝不横向超出页面。 */
+  function relayoutToFit() {
+    if (!st) return;
+    const W = boardW();
+    if (st.colMode) { autoArrange(); return; }
+    if (st._lastW && st._lastW > 0) {
+      const s = W / st._lastW;
+      st.boxes.forEach((b) => {
+        b.w = Math.max(MIN_W, Math.round(b.w * s));
+        b.h = Math.max(MIN_H, Math.round(b.h * s));
+      });
+    }
+    st._lastW = W;
+    if (st.overlap) {
+      st.boxes.forEach(clampBox);   // 允许重叠：仅保证不越界
+    } else {
+      arrange();                    // 不重叠：保留大小换行重排
+    }
+    applyBoxes();
+  }
+
+  function clampBox(b) {
+    const cw = boardCW();
+    b.x = Math.min(Math.max(0, b.x), Math.max(0, cw - b.w));
+    b.y = Math.max(0, b.y);
+    b.w = Math.min(Math.max(MIN_W, b.w), cw);
+    b.h = Math.max(MIN_H, b.h);
+    return b;
+  }
+
+  function overlapBoxes(a, b) {
+    return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+  }
+
+  /* 把 a 从 b 上推开（b 不动）；优先右/下；左/上仅当能完整放下时才采用
+     （否则被 clamp 回退到 0 会重新叠上）；横向越界则换行到 b 下方 */
+  function pushOut(a, b) {
+    const W = boardW();
+    const cands = [
+      { d: (b.x + b.w) - a.x, f: () => { a.x = b.x + b.w + 2; } },   // 右
+      { d: (b.y + b.h) - a.y, f: () => { a.y = b.y + b.h + 2; } },   // 下
+    ];
+    if (b.x - a.w - 2 >= PAD) cands.push({ d: (a.x + a.w) - b.x, f: () => { a.x = b.x - a.w - 2; } });  // 左
+    if (b.y - a.h - 2 >= 0) cands.push({ d: (a.y + a.h) - b.y, f: () => { a.y = b.y - a.h - 2; } });     // 上
+    cands.sort((p, q) => p.d - q.d)[0].f();
+    if (a.x < PAD) a.x = PAD;
+    if (a.x + a.w > W + PAD) { a.x = PAD; a.y = b.y + b.h + 2; }  // 越界 → 换行到下方
+  }
+
+  /* 不重叠模式：松手后把被拖动的卡片从别人身上推开（只动自己，不推别人，行为可预期） */
+  function settleMoved(i) {
+    if (st.overlap) return;
+    for (let pass = 0; pass < 16; pass++) {
+      let changed = false;
+      for (let j = 0; j < st.boxes.length; j++) {
+        if (j === i) continue;
+        if (overlapBoxes(st.boxes[i], st.boxes[j])) { pushOut(st.boxes[i], st.boxes[j]); changed = true; }
+      }
+      if (!changed) break;
+    }
+    clampBox(st.boxes[i]);
+  }
+
+  /* 不允许重叠时缩放：压到谁就先缩谁；缩不动（小于最小尺寸）就放到底下 */
+  function resolveResizeOverlap(movedIdx) {
+    if (st.overlap) return;
+    const b = st.boxes[movedIdx];
+    for (let j = 0; j < st.boxes.length; j++) {
+      if (j === movedIdx) continue;
+      const a = st.boxes[j];
+      if (!overlapBoxes(a, b)) continue;
+      const ox = Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x);
+      const oy = Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y);
+      if (ox > 0 && ox <= oy) {
+        const shrink = Math.min(ox, a.w - MIN_W);
+        if (shrink > 0) {
+          if (a.x < b.x) a.w -= shrink;          // a 在左：缩右缘
+          else { a.x += shrink; a.w -= shrink; } // a 在右：缩左缘
+        } else {
+          a.y = b.y + b.h + GAP;                  // 缩不动 → 放到底下
+        }
+      } else if (oy > 0) {
+        const shrink = Math.min(oy, a.h - MIN_H);
+        if (shrink > 0) {
+          if (a.y < b.y) a.h -= shrink;          // a 在上：缩下缘
+          else { a.y += shrink; a.h -= shrink; } // a 在下：缩上缘
+        } else {
+          a.y = b.y + b.h + GAP;
+        }
+      }
+      clampBox(a);
+    }
+  }
+
+  /* 切换按钮高亮状态（同步翻页 / 乱序 / 允许重叠 / 自动排列） */
+  function syncToggle(id, on) {
+    const el = document.getElementById(id);
+    if (el) el.classList.toggle("on", !!on);
+  }
+
+  /* 选中某张卡：置顶 + 高亮边框（重叠模式下最直观）；传 null 取消选中 */
+  function selectCard(i) {
+    st.selected = i;
+    document.querySelectorAll("#board .col").forEach((col) => {
+      const on = Number(col.dataset.idx) === i;
+      col.classList.toggle("selected", on);
+      col.style.zIndex = on ? "10" : "";
+    });
+  }
+
+  function applyBoxes() {
+    document.querySelectorAll("#board .col").forEach((col) => {
+      const i = Number(col.dataset.idx);
+      const b = st.boxes[i];
+      if (!b) return;
+      col.style.left = b.x + "px";
+      col.style.top = b.y + "px";
+      col.style.width = b.w + "px";
+      col.style.height = b.h + "px";
+    });
+    syncBoardSize();
+    refreshAllSrc();
+  }
+
+  function syncBoardSize() {
+    const board = document.getElementById("board");
+    let bottom = PAD;
+    st.boxes.forEach((b) => { bottom = Math.max(bottom, b.y + b.h); });
+    board.style.height = (bottom + PAD) + "px";
+  }
+
+  function syncLayoutSeg() {
+    document.querySelectorAll("#layout-seg button").forEach((b) =>
+      b.classList.toggle("on", !!(st && st.colMode && Number(b.dataset.cols) === st.cols)));
+  }
+
+  /* 通用拖拽 */
+  function drag(cursor, moveFn, endFn) {
+    document.body.style.cursor = cursor;
+    document.body.style.userSelect = "none";
+    const move = (ev) => moveFn(ev);
+    const up = () => {
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", up);
+      if (endFn) endFn();
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", up);
+  }
+
+  function startMove(e, i) {
+    if (!st) return;
+    e.preventDefault();
+    e.stopPropagation();
+    st.colMode = false;                // 手动移动 → 退出按列排列（按钮熄灭）
+    syncLayoutSeg();
+    const b = st.boxes[i];
+    const col = document.querySelector(`#board .col[data-idx="${i}"]`);
+    selectCard(i);
+    if (col) col.classList.add("moving");   // 拖动中半透明
+    const sx = e.clientX, sy = e.clientY;
+    const ox = b.x, oy = b.y;
+    drag("move",
+      (ev) => {
+        b.x = ox + (ev.clientX - sx);
+        b.y = oy + (ev.clientY - sy);
+        clampBox(b);
+        applyBoxes();          // 拖动中自由移动，不做碰撞
+      },
+      () => {
+        if (col) col.classList.remove("moving");
+        try {
+          settleMoved(i);
+          if (!st.overlap) settleAll();   // 兜底：释放后保证零重叠
+          if (st.auto) arrange();
+        } catch (err) { if (window.OpLog) OpLog.add("移动结束错误: " + err.message); }
+        applyBoxes();
+        refreshAllSrc();
+      });
+  }
+
+  function startResize(e, i, dir) {
+    if (!st) return;
+    e.preventDefault();
+    e.stopPropagation();
+    st.colMode = false;                // 手动缩放 → 退出按列排列
+    syncLayoutSeg();
+    const b = st.boxes[i];
+    selectCard(i);
+    const sx = e.clientX, sy = e.clientY;
+    const o = { ...b };
+    drag(dirCursor(dir),
+      (ev) => {
+        const dx = ev.clientX - sx, dy = ev.clientY - sy;
+        const W = boardW();
+        let { x, y, w, h } = o;
+        if (dir.includes("e")) w = o.w + dx;
+        if (dir.includes("s")) h = o.h + dy;
+        if (dir.includes("w")) { w = o.w - dx; x = o.x + dx; }
+        if (dir.includes("n")) { h = o.h - dy; y = o.y + dy; }
+        if (w < MIN_W) { if (dir.includes("w")) x = o.x + o.w - MIN_W; w = MIN_W; }
+        if (h < MIN_H) { if (dir.includes("n")) y = o.y + o.h - MIN_H; h = MIN_H; }
+        x = Math.max(0, x);
+        y = Math.max(0, y);
+        if (x + w > W) { if (dir.includes("w")) x = Math.max(0, W - w); else w = W - x; }
+        b.x = x; b.y = y; b.w = Math.max(MIN_W, w); b.h = Math.max(MIN_H, h);
+        if (!st.overlap) resolveResizeOverlap(i);   // 不允许重叠：压到谁先缩谁
+        applyBoxes();
+      },
+      () => {
+        try {
+          settleMoved(i);
+          if (!st.overlap) settleAll();   // 兜底：释放后保证零重叠
+          if (st.auto) arrange();
+        } catch (err) { if (window.OpLog) OpLog.add("缩放结束错误: " + err.message); }
+        applyBoxes();
+        refreshAllSrc();
+      });
+  }
+
+  function dirCursor(dir) {
+    return { n: "ns-resize", s: "ns-resize", w: "ew-resize", e: "ew-resize",
+             nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" }[dir] || "move";
+  }
+
+  function updateImages() {
+    if (!st) return;
+    document.querySelectorAll("#board .col").forEach((col) => {
+      const i = Number(col.dataset.idx);
+      const v = versionAt(i);
+      const img = col.querySelector(".slide");
+      if (!v || v.status !== "ready" || !v.pages || !v.pages.length) {
+        img.style.display = "none";
+        return;
+      }
+      const pg = v.pages[Math.min(curPage(i), v.pages.length - 1)];
+      img.style.display = "";
+      img.dataset.thumb = App.imgSrc(pg.thumb);
+      img.dataset.full = App.imgSrc(pg.src);
+      img.dataset.pgW = String(pg.w || 0);
+      img.dataset.current = "";
+      refreshSrc(img);
+    });
+  }
+
+  /* 显示宽度超过缩略图原始大小（或超过原图 50%）时用原图，否则用缩略图；每次换页/换 Deck/缩放都重新判断 */
+  function refreshSrc(img) {
+    const col = img.closest(".col");
+    const body = col && col.querySelector(".col-body");
+    const pgW = Number(img.dataset.pgW) || 0;
+    const dispW = body ? body.clientWidth : 0;
+    // 记住缩略图原始宽度：当前正显示缩略图时读取 naturalWidth
+    if (img.dataset.current === img.dataset.thumb && img.naturalWidth) {
+      img.dataset.thumbW = String(img.naturalWidth);
+    }
+    const thumbW = Number(img.dataset.thumbW) || 0;
+    const useFull = pgW && ((thumbW && dispW > thumbW) || dispW / pgW > FULL_RATIO);
+    const want = useFull ? img.dataset.full : img.dataset.thumb;
+    if (want && img.dataset.current !== want) {
+      img.dataset.current = want;
+      img.src = want;
+    }
+  }
+  function refreshAllSrc() {
+    document.querySelectorAll("#board .col .slide").forEach(refreshSrc);
+  }
+
+  function onColClick(ev) {
+    const img = ev.target.closest("img.slide");
+    if (img) {
+      const col = img.closest(".col");
+      const i = Number(col.dataset.idx);
+      if (st.selected !== i) { selectCard(i); return; }  // 未选中：先选中，不放大
+      toggleFull(img);                                     // 已选中：再点放大
+      return;
+    }
+    const btn = ev.target.closest("button");
+    if (btn) {
+      if (!st) return;
+      const col = btn.closest(".col");
+      const i = Number(col.dataset.idx);
+      const v = versionAt(i);
+      const a = btn.dataset.action;
+      if (a === "score") {
+        const s = Number(btn.dataset.val);
+        if (st.scores[v.dataset_id] === s) delete st.scores[v.dataset_id];
+        else st.scores[v.dataset_id] = s;
+        refreshColButtons(col);
+        markDirty();
+      } else if (a === "best") {
+        st.best = st.best === v.dataset_id ? null : v.dataset_id;
+        if (st.best !== null && st.worst === st.best) st.worst = null;  // 最好/最差不能是同一组
+        refreshColButtonsAll();
+        refreshAllBorders();
+        markDirty();
+      } else if (a === "worst") {
+        st.worst = st.worst === v.dataset_id ? null : v.dataset_id;
+        if (st.worst !== null && st.best === st.worst) st.best = null;  // 最好/最差不能是同一组
+        refreshColButtonsAll();
+        refreshAllBorders();
+        markDirty();
+      }
+      return;
+    }
+    // 点击框体任意其它部位（含图片下方灰区）→ 选中该框
+    const col = ev.target.closest(".col");
+    if (col && st) selectCard(Number(col.dataset.idx));
+  }
+
+  function toggleFull(img) {
+    if (!st || !img.dataset.full) return;
+    const lb = document.getElementById("lightbox");
+    document.getElementById("lightbox-img").src = img.dataset.full;
+    lb.hidden = false;
+  }
+
+  function refreshColButtons(col) {
+    col.querySelectorAll(".score").forEach((b) =>
+      b.classList.toggle("on", st.scores[col.dataset.dsid] === Number(b.dataset.val)));
+    col.querySelector(".rank.best").classList.toggle("on", st.best === Number(col.dataset.dsid));
+    col.querySelector(".rank.worst").classList.toggle("on", st.worst === Number(col.dataset.dsid));
+  }
+  function refreshColButtonsAll() {
+    document.querySelectorAll("#columns .col").forEach(refreshColButtons);
+  }
+  function refreshAllBorders() {
+    document.querySelectorAll("#columns .col").forEach((col) => {
+      const dsid = Number(col.dataset.dsid);
+      col.classList.toggle("ranked-best", st.best === dsid);
+      col.classList.toggle("ranked-worst", st.worst === dsid);
+    });
+  }
+
+  /* 当前标注快照：status 传 "draft" 或 "submitted"；提交时间保留旧值或首次生成 */
+  function snapshot(status) {
+    const prev = App.state.savedAnnotations[st.deck.id] || null;
+    const wasSubmitted = prev && prev.submitted_at;
+    const submitted_at = status === "submitted"
+      ? (wasSubmitted || new Date().toISOString())
+      : (wasSubmitted || null);
+    return {
+      status,
+      best: st.best,
+      worst: st.worst,
+      scores: Object.assign({}, st.scores),
+      updated_at: new Date().toISOString(),
+      submitted_at,
+    };
+  }
+
+  /* 乐观更新：只更新内存与侧栏标记（●/✓），不自动落盘（保存时机见 flush / save） */
+  function markDirty() {
+    if (!st) return;
+    dirty = true;
+    App.state.annotations[st.deck.id] = snapshot(st.status === "submitted" ? "submitted" : "draft");
+    Explorer.render();
+    document.getElementById("annot-saved").textContent = "未保存";
+  }
+
+  /* 手动保存：保存草稿 / 提交 */
+  async function save(submit) {
+    if (!st) return;
+    const next = snapshot(submit ? "submitted" : "draft");
+    st.status = next.status;
+    document.getElementById("annot-saved").textContent = "保存中…";
+    try {
+      await App.saveAnnotation(st.deck.id, next);
+      dirty = false;
+      document.getElementById("annot-saved").textContent = submit ? "已提交 ✓" : "已保存 ✓";
+    } catch (e) {
+      document.getElementById("annot-saved").textContent = "保存失败";
+      if (window.OpLog) OpLog.add("保存失败 " + st.deck.name + ": " + e.message);
+    }
+    if (submit) App.stepDeck(1);
+  }
+
+  /* 切换/关闭前落盘当前草稿（保持原提交状态；有差异才写） */
+  function flush() {
+    if (!st) return;
+    const id = st.deck.id;
+    const status = st.status === "submitted" ? "submitted" : "draft";
+    const next = snapshot(status);
+    const prev = App.state.savedAnnotations[id] || null;
+    if (JSON.stringify(prev) === JSON.stringify(next)) return;
+    dirty = false;
+    document.getElementById("annot-saved").textContent = "保存中…";
+    App.saveAnnotation(id, next).then(() => {
+      if (st && st.deck.id === id) document.getElementById("annot-saved").textContent = "已保存 ✓";
+    }).catch(() => {
+      dirty = true;
+      if (window.OpLog) OpLog.add("自动保存失败 " + id);
+    });
+  }
+
+  /* 供外部（清空按钮）使用 */
+  function hasDeck() { return !!st; }
+  function currentDeckId() { return st ? st.deck.id : null; }
+  function resetCurrent() {
+    if (!st) return;
+    st.best = null; st.worst = null; st.scores = {}; st.status = "draft";
+    dirty = false;
+    refreshColButtonsAll();
+    refreshAllBorders();
+    document.getElementById("annot-saved").textContent = "已清空";
+  }
+
+  function refreshStatus(deck) {
+    if (st && st.deck.id === deck.id) { st.deck = deck; updateImages(); renderPageNav(); }
+  }
+
+  /* 从其它页面切回标注页时：布局可见后按框体实际大小重新判断原图/缩略图 */
+  function onShown() {
+    if (!st) return;
+    requestAnimationFrame(() => refreshAllSrc());
+  }
+
+  function bind() {
+    document.getElementById("columns").addEventListener("click", onColClick);
+    // 单击空白处取消选中
+    document.getElementById("board").addEventListener("click", (e) => {
+      if (e.target === e.currentTarget) selectCard(null);
+    });
+
+    // 同步翻页：单击切换（页码紧跟其后）
+    document.getElementById("sync-page").addEventListener("click", () => {
+      if (!st) return;
+      st.sync = !st.sync;
+      App.state.prefs.sync_page = st.sync;
+      App.savePrefs();
+      syncToggle("sync-page", st.sync);
+      updateImages();
+      renderPageNav();
+    });
+    // 乱序：单击立即乱序/恢复当前 Deck（并记忆偏好）
+    document.getElementById("shuffle").addEventListener("click", () => {
+      App.state.prefs.shuffle = !App.state.prefs.shuffle;
+      App.savePrefs();
+      syncToggle("shuffle", App.state.prefs.shuffle);
+      if (!st) return;
+      st.order = App.state.prefs.shuffle ? shuffled(st.baseOrder) : st.baseOrder.slice();
+      renderColumns(true);   // 立即生效，保留位置与大小
+      updateImages();
+    });
+    // 允许重叠：单击切换（须先关闭自动排列）
+    document.getElementById("overlap").addEventListener("click", () => {
+      if (!st) return;
+      if (st.auto) {
+        st.auto = false;
+        App.state.prefs.auto = false;
+        syncToggle("auto-arrange", false);
+      }
+      st.overlap = !st.overlap;
+      App.state.prefs.overlap = st.overlap;
+      App.savePrefs();
+      syncToggle("overlap", st.overlap);
+      if (!st.overlap) arrange();   // 关闭允许重叠 → 默认自动排一遍
+    });
+    // 自动排列：单击=排一遍/取消；双击=开启连续自动排列（开启时强制关闭允许重叠）
+    let autoClickTimer = null;
+    const autoBtn = document.getElementById("auto-arrange");
+    autoBtn.addEventListener("click", () => {
+      if (autoClickTimer) clearTimeout(autoClickTimer);
+      autoClickTimer = setTimeout(() => {
+        autoClickTimer = null;
+        if (!st) return;
+        if (st.auto) {
+          st.auto = false;
+          App.state.prefs.auto = false;
+          App.savePrefs();
+          syncToggle("auto-arrange", false);
+        } else {
+          arrange();   // 未选中时单击：自动排一遍（保留大小）
+        }
+      }, 250);
+    });
+    autoBtn.addEventListener("dblclick", () => {
+      if (autoClickTimer) { clearTimeout(autoClickTimer); autoClickTimer = null; }
+      if (!st) return;
+      st.auto = true;
+      st.overlap = false;
+      App.state.prefs.auto = true;
+      App.state.prefs.overlap = false;
+      App.savePrefs();
+      syncToggle("auto-arrange", true);
+      syncToggle("overlap", false);
+      arrange();
+    });
+
+    document.getElementById("btn-submit").addEventListener("click", () => save(true));
+    document.getElementById("btn-save-draft").addEventListener("click", () => save(false));
+    document.getElementById("btn-prev-deck").addEventListener("click", () => App.stepDeck(-1));
+    document.getElementById("btn-next-deck").addEventListener("click", () => App.stepDeck(1));
+
+    // 布局：每行 N 列（图标按钮）→ 进入按列排列模式
+    document.querySelectorAll("#layout-seg button").forEach((b) =>
+      b.addEventListener("click", () => {
+        if (!st) return;
+        st.cols = Number(b.dataset.cols);
+        st.colMode = true;
+        App.state.prefs.cols = st.cols;
+        App.savePrefs();
+        autoArrange();
+        syncLayoutSeg();
+      }));
+
+    // 空格 + 滚轮 = 滚动卡片流（不翻页）；普通滚轮在卡片上 = 翻页
+    document.addEventListener("keydown", (e) => {
+      if (e.code === "Space") {
+        spaceDown = true;
+        if (!/^(INPUT|BUTTON|SELECT|TEXTAREA)$/.test(e.target.tagName)) e.preventDefault();
+      }
+    });
+    document.addEventListener("keyup", (e) => {
+      if (e.code === "Space") spaceDown = false;
+    });
+    window.addEventListener("resize", () => {
+      if (!st) return;
+      relayoutToFit();
+    });
+
+    // 图片放大查看器：点击背景 / 按 Esc 关闭
+    const lb = document.getElementById("lightbox");
+    lb.addEventListener("click", () => { lb.hidden = true; });
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && lb && !lb.hidden) lb.hidden = true;
+    });
+  }
+
+  return { openDeck, close, bind, refreshStatus, onViewportResize: relayoutToFit, onShown,
+           hasDeck, currentDeckId, resetCurrent, hasDirty: () => dirty, flush };
+})();

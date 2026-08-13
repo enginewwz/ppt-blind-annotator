@@ -1,0 +1,348 @@
+"""M0 骨架：读配置 → 扫描输入目录 → 按文件名归组 Deck → 生成 manifest/status（全部 pending）。
+
+渲染管线（soffice/PyMuPDF/Pillow）在 M1 加入；本脚本只负责「分组 + 建清单」。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import multiprocessing as mp
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+# 允许 `python scripts/ingest.py` 直接运行（也支持 `python -m scripts.ingest`）
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from scripts import paths  # noqa: E402
+from scripts.atomic import atomic_write_json, now_iso  # noqa: E402
+from scripts.constants import (  # noqa: E402
+    STATUS_FAILED,
+    STATUS_PENDING,
+    STATUS_READY,
+    STATUS_RENDERING,
+)
+from scripts.render import render_version, src_key  # noqa: E402
+
+PPTX_EXTS = {".pptx", ".ppt"}
+
+
+def load_config(config_path: Path) -> dict:
+    """读取并校验 config.json。"""
+    if not config_path.is_file():
+        raise FileNotFoundError(f"配置文件不存在: {config_path}")
+    with open(config_path, encoding="utf-8") as f:
+        cfg = json.load(f)
+    if "datasets" not in cfg or not isinstance(cfg["datasets"], list):
+        raise ValueError("config.json 必须包含 datasets 列表")
+    return cfg
+
+
+def scan_pptx(dir_path: Path) -> list[Path]:
+    """返回目录下所有 pptx/ppt 文件（按文件名排序）。目录不存在返回空。"""
+    if not dir_path.is_dir():
+        return []
+    return sorted(
+        (p for p in dir_path.iterdir()
+         if p.is_file() and p.suffix.lower() in PPTX_EXTS),
+        key=lambda p: p.name,
+    )
+
+
+def group_decks(datasets: list[dict]) -> list[dict]:
+    """按文件名（去扩展名）把跨数据集的 ppt 归组为 Deck。
+
+    返回: [{"name": ..., "versions": [{"dataset_name", "file_path"}]}]
+    """
+    decks: dict[str, dict[str, Any]] = {}
+    for ds in datasets:
+        ds_name = str(ds["name"])
+        ds_path = Path(str(ds["path"]))
+        for f in scan_pptx(ds_path):
+            stem = f.stem
+            deck = decks.setdefault(stem, {"name": stem, "versions": []})
+            deck["versions"].append({
+                "dataset_name": ds_name,
+                "file_path": str(f),
+            })
+    return list(decks.values())
+
+
+def build_manifest(cfg: dict) -> dict:
+    """构建 manifest：数据集分配 id；Deck/版本初始为 pending。"""
+    datasets = cfg["datasets"]
+    datasets_out = [
+        {"id": i + 1, "name": str(ds["name"]), "sort_order": int(ds.get("sort_order", i))}
+        for i, ds in enumerate(datasets)
+    ]
+    ds_id_by_name = {d["name"]: d["id"] for d in datasets_out}
+
+    decks_out: list[dict[str, Any]] = []
+    for deck in group_decks(datasets):
+        versions = [
+            {
+                "dataset_id": ds_id_by_name[v["dataset_name"]],
+                "file_path": v["file_path"],
+                "status": STATUS_PENDING,
+                "page_count": 0,
+                "pages": [],
+            }
+            for v in deck["versions"]
+        ]
+        decks_out.append({
+            "id": len(decks_out) + 1,
+            "name": deck["name"],
+            "page_count": 0,
+            "status": STATUS_PENDING,
+            "versions": versions,
+        })
+
+    return {
+        "version": 1,
+        "datasets": datasets_out,
+        "decks": decks_out,
+    }
+
+
+def build_status(manifest: dict) -> dict:
+    """构建轻量状态文件（前端动态轮询用）。"""
+    decks = manifest["decks"]
+    return {
+        "version": manifest["version"],
+        "updated_at": now_iso(),
+        "total": len(decks),
+        "ready": 0,
+        "rendering": 0,
+        "failed": 0,
+        # M1 起 ingest 以 --watch 后台运行时置 True
+        "active": False,
+    }
+
+
+def run(config_path: Path) -> dict:
+    """M0：扫描 + 归组 + 生成 pending 清单（不渲染）。保留用于快速预览/测试。"""
+    cfg = load_config(config_path)
+    manifest = build_manifest(cfg)
+    status = build_status(manifest)
+    paths.META_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(paths.MANIFEST_PATH, manifest)
+    atomic_write_json(paths.STATUS_PATH, status)
+    return {"manifest": manifest, "status": status, "config": cfg}
+
+
+# ---------------- M1：渲染管线 ----------------
+
+
+def load_existing_manifest() -> dict | None:
+    """读取现有 manifest（无则返回 None）。"""
+    if paths.MANIFEST_PATH.is_file():
+        with open(paths.MANIFEST_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def build_or_merge_manifest(cfg: dict) -> dict:
+    """用当前扫描结果重建清单，并把旧清单中「源文件未变且已就绪」的版本带过来（增量/断点续跑）。"""
+    manifest = build_manifest(cfg)
+    old = load_existing_manifest()
+    if old and isinstance(old.get("version"), int):
+        # 保持 version 单调递增（前端据此判断是否变化）
+        manifest["version"] = old["version"]
+
+    if not old or not old.get("decks"):
+        for deck in manifest["decks"]:
+            for v in deck["versions"]:
+                v["src_key"] = src_key(Path(v["file_path"]))
+        finalize_deck_statuses(manifest)
+        return manifest
+
+    old_ds = {d["id"]: d["name"] for d in old.get("datasets", [])}
+    new_ds = {d["id"]: d["name"] for d in manifest["datasets"]}
+    old_by_deck: dict[str, dict[tuple, dict]] = {}
+    for od in old.get("decks", []):
+        old_by_deck[od["name"]] = {
+            (od["name"], old_ds.get(ov.get("dataset_id"))): ov
+            for ov in od.get("versions", [])
+        }
+
+    for deck in manifest["decks"]:
+        for v in deck["versions"]:
+            ds_name = new_ds.get(v["dataset_id"])
+            oldv = old_by_deck.get(deck["name"], {}).get((deck["name"], ds_name))
+            key = src_key(Path(v["file_path"]))
+            if oldv and oldv.get("src_key") == key and oldv.get("status") == STATUS_READY:
+                v["status"] = STATUS_READY
+                v["page_count"] = oldv.get("page_count", 0)
+                v["pages"] = oldv.get("pages", [])
+                v["src_key"] = oldv.get("src_key")
+            else:
+                v["status"] = STATUS_PENDING
+                v["src_key"] = key
+                v["page_count"] = 0
+                v["pages"] = []
+    finalize_deck_statuses(manifest)
+    return manifest
+
+
+def finalize_deck_statuses(manifest: dict) -> None:
+    """按版本状态汇总 Deck 状态与 page_count（就地修改）。"""
+    for deck in manifest["decks"]:
+        st = [v.get("status", STATUS_PENDING) for v in deck["versions"]]
+        if all(s == STATUS_READY for s in st):
+            deck["status"] = STATUS_READY
+        elif any(s == STATUS_RENDERING for s in st):
+            deck["status"] = STATUS_RENDERING
+        elif any(s == STATUS_FAILED for s in st):
+            deck["status"] = STATUS_FAILED
+        else:
+            deck["status"] = STATUS_PENDING
+        deck["page_count"] = max(
+            (v.get("page_count", 0) for v in deck["versions"]), default=0
+        )
+
+
+def build_status_from_manifest(manifest: dict, active: bool) -> dict:
+    decks = manifest["decks"]
+    return {
+        "version": manifest.get("version", 1),
+        "updated_at": now_iso(),
+        "total": len(decks),
+        "ready": sum(1 for d in decks if d["status"] == STATUS_READY),
+        "rendering": sum(1 for d in decks if d["status"] == STATUS_RENDERING),
+        "failed": sum(1 for d in decks if d["status"] == STATUS_FAILED),
+        "active": active,
+    }
+
+
+def warn_missing_datasets(cfg: dict) -> None:
+    """数据集路径不存在时打印警告，避免静默清空清单。"""
+    for ds in cfg.get("datasets", []):
+        if not Path(str(ds["path"])).is_dir():
+            print(f"[ingest] 警告: 数据集 '{ds['name']}' 路径不存在: {ds['path']}")
+
+
+def _persist(manifest: dict, active: bool) -> dict:
+    """原子写 manifest + status（version 自增），返回 status。"""
+    manifest["version"] = int(manifest.get("version", 0)) + 1
+    atomic_write_json(paths.MANIFEST_PATH, manifest)
+    status = build_status_from_manifest(manifest, active)
+    atomic_write_json(paths.STATUS_PATH, status)
+    return status
+
+
+def _render_job(job: tuple) -> tuple:
+    """多进程 worker 入口：解包 (deck_idx, version_idx, args) 并渲染。"""
+    di, vi, args = job
+    return di, vi, render_version(args)
+
+
+def run_render(
+    cfg: dict,
+    jobs: int,
+    dpi: int,
+    thumb_width: int,
+    soffice: str,
+    active: bool,
+) -> dict:
+    """执行一次渲染 pass：合并旧状态 → 标记渲染中 → 渲染 → 逐结果更新 manifest/status。"""
+    manifest = build_or_merge_manifest(cfg)
+    finalize_deck_statuses(manifest)
+
+    ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
+    pending: list[tuple] = []
+    for di, deck in enumerate(manifest["decks"]):
+        for vi, v in enumerate(deck["versions"]):
+            if v.get("status") == STATUS_READY:
+                continue
+            out_dir = paths.RENDERED_DIR / ds_name[v["dataset_id"]] / deck["name"]
+            pending.append((di, vi, {
+                "file_path": v["file_path"],
+                "out_dir": str(out_dir),
+                "dpi": dpi,
+                "thumb_width": thumb_width,
+                "soffice": soffice,
+            }))
+            v["status"] = STATUS_RENDERING
+
+    # 先落一次「渲染中」，前端可立即看到
+    finalize_deck_statuses(manifest)
+    _persist(manifest, active)
+
+    if pending:
+        n = min(jobs, len(pending))
+        if n <= 1:
+            results = [_render_job(job) for job in pending]
+        else:
+            with mp.Pool(processes=n) as pool:
+                results = list(pool.imap_unordered(_render_job, pending))
+
+        root = paths.PROJECT_ROOT
+        for di, vi, res in results:
+            v = manifest["decks"][di]["versions"][vi]
+            if res["ok"]:
+                v["status"] = STATUS_READY
+                v["page_count"] = res["page_count"]
+                pages = []
+                for p in res["pages"]:
+                    src = Path(p["src"])
+                    thumb = Path(p["thumb"])
+                    pages.append({
+                        "src": str(src.relative_to(root)) if src.is_relative_to(root) else p["src"],
+                        "thumb": str(thumb.relative_to(root)) if thumb.is_relative_to(root) else p["thumb"],
+                        "w": p["w"],
+                        "h": p["h"],
+                    })
+                v["pages"] = pages
+                v.pop("error", None)
+            else:
+                v["status"] = STATUS_FAILED
+                v["error"] = res.get("error", "unknown")
+                v["pages"] = []
+            finalize_deck_statuses(manifest)
+            _persist(manifest, active)
+
+    finalize_deck_statuses(manifest)
+    status = _persist(manifest, active)
+    return {"manifest": manifest, "status": status}
+
+
+def _watch_loop(args: argparse.Namespace) -> int:
+    import time
+
+    print(f"[ingest] watch 模式启动（间隔 {args.interval}s，Ctrl+C 停止）")
+    cfg0 = load_config(Path(args.config))
+    warn_missing_datasets(cfg0)
+    while True:
+        cfg = load_config(Path(args.config))
+        run_render(cfg, args.jobs, args.dpi, args.thumb_width, args.soffice, active=True)
+        time.sleep(args.interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="PPT 盲测对照：扫描/归组/渲染/建清单")
+    parser.add_argument("--config", default=str(paths.CONFIG_PATH), help="配置文件路径")
+    parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="渲染并行度")
+    parser.add_argument("--dpi", type=int, default=150, help="渲染 DPI（默认 150）")
+    parser.add_argument("--thumb-width", type=int, default=360, help="缩略图宽度（默认 360）")
+    parser.add_argument("--soffice", default="soffice", help="soffice 可执行文件路径")
+    parser.add_argument("--interval", type=float, default=5.0, help="watch 模式扫描间隔（秒）")
+    parser.add_argument("--watch", action="store_true", help="持续运行（增量，检测新/改文件）")
+    args = parser.parse_args(argv)
+
+    if args.watch:
+        return _watch_loop(args)
+
+    cfg = load_config(Path(args.config))
+    warn_missing_datasets(cfg)
+    result = run_render(cfg, args.jobs, args.dpi, args.thumb_width, args.soffice, active=False)
+    m, s = result["manifest"], result["status"]
+    print(f"[ingest] 数据集: {len(m['datasets'])} 个")
+    print(f"[ingest] Deck: 总 {s['total']} / 就绪 {s['ready']} / 渲染中 {s['rendering']} / 失败 {s['failed']}")
+    print(f"[ingest] manifest -> {paths.MANIFEST_PATH}")
+    print(f"[ingest] status   -> {paths.STATUS_PATH}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
