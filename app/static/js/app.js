@@ -19,6 +19,14 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
+/* 标注内容是否实质相同（忽略 updated_at/submitted_at 时间戳）：
+   用于判断是否真的改过，避免「仅翻页/移动/缩放」也触发落盘或历史日志 */
+function sameAnno(a, b) {
+  if (!a || !b) return !a && !b;
+  return a.status === b.status && a.best === b.best && a.worst === b.worst &&
+    JSON.stringify(a.scores || {}) === JSON.stringify(b.scores || {});
+}
+
 /* 绝对路径公共前缀（用于定位数据集容器目录） */
 function absCommonPrefix(paths) {
   if (!paths.length) return "";
@@ -57,7 +65,10 @@ const Datasets = {
   statuses: new Set(),  // 空集合 = 全部
   axis: "deck",         // deck | dataset（纵轴）
   rendered: [],         // 正在渲染的文件夹名（来自 config.json）
-  candidates: [],       // 备选文件夹名（容器内未在渲染的）
+  candidates: [],       // 备选文件夹 [{name, rel}]（可加入渲染；rel 为相对 data/ 的路径）
+  candMap: {},          // name → {name, rel} 快速查找
+  containerRel: "",     // 数据源容器相对 data/ 的路径（持久化，供全取消后重加拼路径）
+  containerAbs: "",     // 数据源容器绝对路径（持久化）
   addSet: new Set(),    // 勾选要加入渲染的备选
   rmSet: new Set(),     // 勾选要取消渲染的现有组
 
@@ -68,17 +79,45 @@ const Datasets = {
     this.rendered = (this.cfg.datasets || []).map((d) => d.name);
     this.candidates = [];
     const cfgDs = this.cfg.datasets || [];
+    // 有数据源时：记录容器目录（相对+绝对，持久化），并从容器扫描候选
     if (cfgDs.length) {
       try {
         const relFirst = await findDirRel(cfgDs[0].name);
         if (relFirst) {
-          const relContainer = relFirst.split("/").slice(0, -1).join("/");
-          const entries = await FS.listDir(relContainer);
-          this.candidates = entries.filter((e) => e.kind === "directory").map((e) => e.name)
-            .filter((n) => !this.rendered.includes(n));
+          this.containerRel = relFirst.split("/").slice(0, -1).join("/");
+          const paths = cfgDs.map((d) => d.path).filter(Boolean);
+          let ca = absCommonPrefix(paths);
+          if (cfgDs.length === 1) {   // 单个数据源：公共前缀即它自身 → 容器取其父目录
+            const i = ca.lastIndexOf("/");
+            ca = i > 0 ? ca.slice(0, i) : "";
+          }
+          this.containerAbs = ca || "";
+          try {
+            localStorage.setItem("ppt.containerRel", this.containerRel);
+            localStorage.setItem("ppt.containerAbs", this.containerAbs);
+          } catch (_) { /* ignore */ }
+          const entries = await FS.listDir(this.containerRel);
+          this.candidates = entries.filter((e) => e.kind === "directory").map((e) => ({
+            name: e.name,
+            rel: this.containerRel ? this.containerRel + "/" + e.name : e.name,
+          })).filter((c) => !this.rendered.includes(c.name));
         }
       } catch (_) { /* ignore */ }
     }
+    // 容器扫描为空 / config 已无数据源（全部取消渲染）→ 全树扫描「直接含 pptx 的目录」作可加回的数据源
+    if (!this.candidates.length) {
+      let dirs = [];
+      try { dirs = await FS.findSourceDirs(4); } catch (_) { /* ignore */ }
+      this.candidates = dirs.filter(Boolean)
+        .map((rel) => ({ name: rel.split("/").pop(), rel }))
+        .filter((c) => !this.rendered.includes(c.name));
+      try {
+        this.containerRel = localStorage.getItem("ppt.containerRel") || "";
+        this.containerAbs = localStorage.getItem("ppt.containerAbs") || "";
+      } catch (_) { /* ignore */ }
+    }
+    this.candMap = {};
+    this.candidates.forEach((c) => { this.candMap[c.name] = c; });
   },
 
   async renderSidebar() {
@@ -92,8 +131,8 @@ const Datasets = {
     const renderedHtml = this.rendered.map((n) =>
       item("rm", n, this.rmSet.has(n), this.rmSet.has(n) ? "rm" : "")).join("") ||
       '<div class="empty muted">（暂无渲染中的组）</div>';
-    const candHtml = this.candidates.map((n) =>
-      item("add", n, this.addSet.has(n), this.addSet.has(n) ? "add" : "")).join("") ||
+    const candHtml = this.candidates.map((c) =>
+      item("add", c.name, this.addSet.has(c.name), this.addSet.has(c.name) ? "add" : "")).join("") ||
       '<div class="empty muted">（无备选文件夹）</div>';
     const dirty = this.addSet.size + this.rmSet.size > 0;
     el.innerHTML =
@@ -161,13 +200,17 @@ const Datasets = {
       if (this.rmSet.size) ds = ds.filter((d) => !this.rmSet.has(d.name));
       // 加入渲染：把备选文件夹写进配置
       if (this.addSet.size) {
-        const allPaths = (cfg.datasets || []).map((d) => d.path);
-        const parentAbs = absCommonPrefix(allPaths);
+        const allPaths = (cfg.datasets || []).map((d) => d.path).filter(Boolean);
+        let parentAbs = absCommonPrefix(allPaths);
+        if (allPaths.length === 1) {   // 单个数据源：公共前缀即它自身 → 容器取其父目录
+          const i = parentAbs.lastIndexOf("/");
+          parentAbs = i > 0 ? parentAbs.slice(0, i) : "";
+        }
         let maxOrder = Math.max(-1, ...ds.map((d) => d.sort_order ?? -1));
         const existing = new Set(ds.map((d) => d.name));
         for (const nm of this.addSet) {
           if (existing.has(nm)) continue;
-          ds.push({ name: nm, path: (parentAbs || "") + "/" + nm, sort_order: ++maxOrder });
+          ds.push({ name: nm, path: this.absPathFor(nm, parentAbs), sort_order: ++maxOrder });
           existing.add(nm);
         }
       }
@@ -177,8 +220,29 @@ const Datasets = {
       this.rmSet.clear();
       await this.renderSidebar();
       this.render();
+      // 提交后立即快速轮询：ingest 一重建 manifest，框数量/渲染状态就能尽快反映
+      App._pollDelay = 1000;
+      App.poll();
       alert("已提交修改并写入 config.json。\n（若 ingest 以 --watch 运行，会自动开始/停止对应组的渲染；否则请运行 python -m scripts.ingest --watch）");
     } catch (e) { alert("提交失败：" + e.message); }
+  },
+
+  /* 计算加入渲染的数据源绝对路径：
+     优先现有数据源容器公共前缀；否则用持久化的容器信息重建；最后退化为相对路径（ingest 以项目根解析）。 */
+  absPathFor(nm, parentAbs) {
+    if (parentAbs && parentAbs !== "/") return parentAbs + "/" + nm;
+    const c = this.candMap && this.candMap[nm];
+    if (this.containerAbs) {
+      let root = this.containerAbs;
+      const parts = (this.containerRel || "").split("/").filter(Boolean);
+      for (let k = 0; k < parts.length; k++) {   // 去掉容器分量 → data/ 根
+        const i = root.lastIndexOf("/");
+        if (i <= 0) { root = ""; break; }
+        root = root.slice(0, i);
+      }
+      if (root) return root + "/" + (c ? c.rel : nm);
+    }
+    return "data/" + (c ? c.rel : nm);   // 兜底：相对项目根
   },
 
   /* 同步控制条：纵轴下拉值 + 状态多选勾选/按钮文案 */
@@ -273,8 +337,10 @@ const App = {
           if (!this.state.currentDeckId) this.openFirstReady();
           this.poll();
         } catch (e) {
+          // 目录读取失败（句柄失效 / 权限被重置 / 路径不对）→ 弹出重新授权的选择窗格
+          this.showOverlay();
           document.getElementById("sb-annot").textContent =
-            "目录读取失败，请点右上角「data 目录」重新授权";
+            "目录读取失败，请重新选择 data 目录";
           this.updateStatusBar();
         }
       } else {
@@ -472,23 +538,19 @@ const App = {
       if (changed) {
         await this.refreshManifest();
         await this.refreshAnnotations();
-        if (this.state.currentDeckId) {
-          const d = this.deckById(this.state.currentDeckId);
-          if (d) Annotate.refreshStatus(d);
-        }
+        this.syncOpenDeck();
       }
     }
     this.updateStatusBar();
-    const st = this.state.status || { rendering: 0 };
-    let delay;
-    if (document.hidden) delay = 60000;                                   // 隐藏暂停
-    else if (st.rendering > 0) { delay = 1000; this._pollDelay = 1000; }  // 有渲染任务：快
-    else { this._pollDelay = Math.min(this._pollDelay * 2, 30000); delay = this._pollDelay; }  // 空闲退避
+    // status.json 是小文件：固定 1s 轮询，及时反映渲染完成 / 数据源数量变化。
+    // 后端已保证「无变化不写盘」，version 稳定时不会重复重读 manifest。
+    const delay = document.hidden ? 60000 : 1000;   // 标签页隐藏暂停轮询
     this._pollTimer = setTimeout(() => this.poll(), delay);
   },
 
   /* ---------- 视图与路由 ---------- */
   setView(view) {
+    const prev = this.state.view;   // 记录上一个视图，判断是否为「切到标注页」
     this.state.view = view;
     document.querySelectorAll("#activitybar button").forEach((b) =>
       b.classList.toggle("active", b.dataset.view === view));
@@ -506,7 +568,17 @@ const App = {
     if (view === "explorer") {
       document.getElementById("empty-state").hidden =
         this.state.decks.some((d) => d.status === "ready");
-      if (Annotate && Annotate.onShown) Annotate.onShown();   // 切回标注页：按框体大小重判原图/缩略图
+      // 从其它页面切到标注页：重读 manifest 并同步当前 Deck（版本数变化→重建框格），
+      // 再按框体大小重判原图/缩略图；并加快轮询，尽快反映 ingest 的最新渲染/数据源数量。
+      // 本就停留在标注页：什么都不做，避免重复刷新。
+      if (prev !== "explorer") {
+        this._pollDelay = 1000;
+        this.poll();
+        this.refreshManifest().then(() => {
+          this.syncOpenDeck();
+          if (Annotate && Annotate.onShown) Annotate.onShown();
+        });
+      }
     }
   },
 
@@ -518,6 +590,24 @@ const App = {
 
   deckById(id) { return this.state.decks.find((d) => d.id === id) || null; },
 
+  /* manifest 变化后同步当前打开的 Deck：版本数变化重建卡片；Deck 消失→清空画布；重现→自动重开 */
+  syncOpenDeck() {
+    const id = this.state.currentDeckId;
+    if (id == null) return;
+    const deck = this.deckById(id);
+    if (deck) {
+      Annotate.refreshStatus(deck);
+      if (!Annotate.hasDeck() && this.state.view === "explorer") {
+        this.openDeck(id, { allowPending: true });   // 数据源回到 ≥1 个时重新打开：先空框、渲染好再填充
+      }
+    } else if (Annotate.hasDeck()) {
+      Annotate.close();                              // 数据源全取消 → 画布清空（什么都不显示）
+      // 清掉左下角“渲染中，请稍候…”等旧提示与旧 Deck 名
+      document.getElementById("sb-annot").textContent = "";
+      document.getElementById("sb-deck").textContent = "";
+    }
+  },
+
   openFirstReady() {
     const d = this.state.decks.find((x) => x.status === "ready");
     if (d) this.openDeck(d.id);
@@ -526,7 +616,8 @@ const App = {
   openDeck(id, opts) {
     const deck = this.deckById(id);
     if (!deck) return;
-    if (deck.status !== "ready") {
+    const allowPending = !!(opts && opts.allowPending);
+    if (!allowPending && deck.status !== "ready") {
       document.getElementById("sb-annot").textContent = deck.name + " 尚未就绪（渲染中）";
       return;
     }
@@ -550,7 +641,7 @@ const App = {
   /* ---------- 标注保存（先写历史，再原子覆盖；以已存快照做差异） ---------- */
   async saveAnnotation(deckId, next) {
     const prev = this.state.savedAnnotations[deckId] || null;
-    if (prev && JSON.stringify(prev) !== JSON.stringify(next)) {
+    if (prev && !sameAnno(prev, next)) {   // 内容实质变化才记历史（忽略时间戳）
       await FS.appendLine("annotations_history.jsonl",
         JSON.stringify({ deck_id: Number(deckId), ts: new Date().toISOString(), prev }));
     }

@@ -96,6 +96,13 @@ ppt-blind-annotator/
 | `python scripts/make_demo.py` | 生成 4 组演示 pptx（methodA~D） |
 | `kill <ingest_pid>` | 停止 ingest --watch |
 
+### 浏览器打开参数（本地可选）
+
+`launch.py` 默认用系统默认浏览器打开前端。若需给 Chromium 系浏览器附加参数（如 WSLg 下
+`--enable-features=UseOzonePlatform --ozone-platform=wayland`），写在**本地 git 忽略**文件
+`scripts/local_browser.py`（`CHROME_EXTRA` 列表）或环境变量 `PPT_BROWSER_EXTRA` 中；
+云端仓库不含本地配置 → 自动用系统默认浏览器，不带这些参数。
+
 ## 数据目录构造示例
 
 > `data/` 等为运行产物目录，不入库；此处给出**构造方式示例**，便于新环境重建。

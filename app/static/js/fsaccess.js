@@ -164,6 +164,31 @@ const FS = (() => {
     return out;
   }
 
+  /* 递归扫描 data/ 树下「直接包含 pptx/ppt 文件的目录」，返回相对路径（如 "demo/methodA"）。
+     用于 config 为空（全部取消渲染）时仍能列出可加回的数据源；跳过 meta/、rendered/。 */
+  async function findSourceDirs(maxDepth = 4) {
+    const out = [];
+    const queue = [""];
+    while (queue.length) {
+      const cur = queue.shift();
+      const depth = cur ? cur.split("/").length : 0;
+      if (depth > maxDepth) continue;
+      let entries;
+      try { entries = await listDir(cur); } catch (_) { continue; }
+      let hasPptx = false;
+      for (const e of entries) {
+        if (e.kind === "directory") {
+          if (e.name === "meta" || e.name === "rendered") continue;
+          queue.push(cur ? cur + "/" + e.name : e.name);
+        } else if (/\.(pptx|ppt)$/i.test(e.name)) {
+          hasPptx = true;
+        }
+      }
+      if (hasPptx) out.push(cur);
+    }
+    return out;
+  }
+
   /* 确保相对路径目录存在（逐级创建），返回最后目录句柄（添加数据集用） */
   async function ensureDir(relPath) {
     let dh = dirHandle;
@@ -200,5 +225,5 @@ const FS = (() => {
     return info;
   }
 
-  return { hasSupport, getHandle, tryRestore, reSelect, readJSON, readFileText, writeJSONAtomic, appendLine, dirInfo, listDir, ensureDir, removeDir };
+  return { hasSupport, getHandle, tryRestore, reSelect, readJSON, readFileText, writeJSONAtomic, appendLine, dirInfo, listDir, findSourceDirs, ensureDir, removeDir };
 })();

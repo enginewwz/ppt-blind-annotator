@@ -82,6 +82,11 @@ const Annotate = (() => {
     st = null;
     const b = document.getElementById("board");
     if (b) b.innerHTML = "";
+    // 清空工具栏残留：Deck 名、保存提示（切换 Deck 时 openDeck 会随后重新设置）；
+    // 全局页码在无 Deck 时显示占位 - / -（与首次打开一致）
+    document.getElementById("annot-deck-name").textContent = "";
+    document.getElementById("pg-indicator").textContent = "- / -";
+    document.getElementById("annot-saved").textContent = "";
   }
 
   function totalPages() { return st && st.deck.page_count ? st.deck.page_count : 1; }
@@ -620,6 +625,13 @@ const Annotate = (() => {
       const i = Number(col.dataset.idx);
       const v = versionAt(i);
       const img = col.querySelector(".slide");
+      // 状态文字随版本刷新：ready → “N 页”，否则显示当前状态（渲染中/待处理/失败等）
+      const meta = col.querySelector(".col-meta");
+      if (meta) {
+        meta.textContent = v && v.status === "ready"
+          ? `${v.page_count} 页`
+          : (v ? v.status : "");
+      }
       if (!v || v.status !== "ready" || !v.pages || !v.pages.length) {
         img.style.display = "none";
         return;
@@ -629,7 +641,8 @@ const Annotate = (() => {
       img.dataset.thumb = App.imgSrc(pg.thumb);
       img.dataset.full = App.imgSrc(pg.src);
       img.dataset.pgW = String(pg.w || 0);
-      img.dataset.current = "";
+      // 不重置 current：换页/换图时 URL 变化，refreshSrc 自然重载；
+      // 同图时不重复赋值 src，避免反复重载图片
       refreshSrc(img);
     });
   }
@@ -765,14 +778,15 @@ const Annotate = (() => {
     if (submit) App.stepDeck(1);
   }
 
-  /* 切换/关闭前落盘当前草稿（保持原提交状态；有差异才写） */
+  /* 切换/关闭前落盘当前草稿：仅在有实际改动时写（翻页/移动/缩放不置脏，不落盘） */
   function flush() {
     if (!st) return;
+    if (!dirty) return;                  // 无实际改动（仅翻页/移动/缩放）→ 不落盘
     const id = st.deck.id;
     const status = st.status === "submitted" ? "submitted" : "draft";
     const next = snapshot(status);
     const prev = App.state.savedAnnotations[id] || null;
-    if (JSON.stringify(prev) === JSON.stringify(next)) return;
+    if (sameAnno(prev, next)) { dirty = false; return; }   // 内容未变（仅时间戳）→ 不写
     dirty = false;
     document.getElementById("annot-saved").textContent = "保存中…";
     App.saveAnnotation(id, next).then(() => {
@@ -796,7 +810,28 @@ const Annotate = (() => {
   }
 
   function refreshStatus(deck) {
-    if (st && st.deck.id === deck.id) { st.deck = deck; updateImages(); renderPageNav(); }
+    if (st && st.deck.id === deck.id) {
+      const prevCount = st.deck.versions.length;
+      const wasReady = st.deck.status === "ready";
+      st.deck = deck;
+      if (deck.versions.length !== prevCount) {
+        // 数据源数量变化：重建卡片（保留列数偏好，重新按列排；已评分数/排名保留）
+        st.baseOrder = deck.versions.map((_, i) => i);
+        st.order = App.state.prefs.shuffle ? shuffled(st.baseOrder) : st.baseOrder.slice();
+        st.page = deck.versions.map(() => 0);
+        st.lastWheel = deck.versions.map(() => 0);
+        st.boxes = deck.versions.map(() => null);
+        st.effCols = 0;
+        renderColumns(false);
+        updateImages();
+        renderPageNav();
+      } else if (!(wasReady && deck.status === "ready")) {
+        // 状态变化（pending/rendering → ready）才刷新图片与状态文字；
+        // 已就绪且数量未变 → 画布已是最终态，停止刷新（目录棕点仍由 Explorer 持续更新）
+        updateImages();
+        renderPageNav();
+      }
+    }
   }
 
   /* 从其它页面切回标注页时：布局可见后按框体实际大小重新判断原图/缩略图 */

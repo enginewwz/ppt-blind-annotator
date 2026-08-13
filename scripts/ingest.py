@@ -298,6 +298,12 @@ def run_render(
             }))
             v["status"] = STATUS_RENDERING
 
+    # 无变化（无待渲染且 manifest 与磁盘一致）→ 不写盘，保持 version 稳定。
+    # 前端固定 1s 轮询 status：version 只在真有变化时 +1，避免空转反复重读大 manifest。
+    old = load_existing_manifest()
+    if not pending and old is not None and old == manifest:
+        return {"manifest": manifest, "status": build_status_from_manifest(manifest, active)}
+
     # 先落一次「渲染中」，前端可立即看到
     finalize_deck_statuses(manifest)
     _persist(manifest, active)
