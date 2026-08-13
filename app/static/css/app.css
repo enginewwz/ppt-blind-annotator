@@ -268,47 +268,78 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 }
 
 /* datasets */
-#datasets { padding: 16px; max-width: 960px; }
-/* 与标注页工具栏同风格：灰色横条 */
+#datasets { display: flex; flex-direction: column; height: 100%; padding: 0; }
+/* 吸附顶部、左右留更多（同标注页工具栏风格） */
 #datasets .ds-toolbar {
-  display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 10px;
+  position: sticky; top: 0; z-index: 10;
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  padding: 6px 16px;
   border-bottom: 1px solid var(--border); background: var(--bg-sidebar);
 }
-#datasets .ds-toolbar .spacer { flex: 1; }
+#datasets .ds-toolbar .sep { width: 1px; height: 18px; background: var(--border); }
+/* 数据页正文控制条：纵轴下拉 + 状态多选下拉 + 刷新 */
+.ds-ctl { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--fg-muted); }
+.ds-ctl select {
+  appearance: none; padding: 4px 8px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-editor); color: var(--fg);
+  font-size: 12px; cursor: pointer;
+}
+.ds-ctl select:focus, .ds-ctl select:hover { border-color: var(--accent); }
+.ms-wrap { position: relative; }
+.ms-btn {
+  padding: 4px 10px; border: 1px solid var(--border); border-radius: var(--radius);
+  background: var(--bg-editor); color: var(--fg); font-size: 12px;
+}
+.ms-btn:hover { border-color: var(--accent); color: var(--accent); }
+.ms-panel {
+  position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
+  min-width: 150px; padding: 6px; background: var(--bg-sidebar);
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 2px;
+}
+.ms-panel label {
+  display: flex; align-items: center; gap: 8px; padding: 4px 8px;
+  border-radius: var(--radius-sm); font-size: 12px; cursor: pointer;
+}
+.ms-panel label:hover { background: var(--bg-hover); }
+#ds-refresh {
+  margin-left: auto; padding: 4px 10px; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--bg-editor); color: var(--fg); font-size: 12px;
+}
+#ds-refresh:hover { border-color: var(--accent); color: var(--accent); }
+#ds-content { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; }
+.ds-scroll { overflow: auto; min-width: 0; }
 .ds-table-wrap {
   background: var(--bg-sidebar); border: 1px solid var(--border);
-  border-radius: var(--radius-lg); overflow: hidden; padding: 4px;
+  border-radius: var(--radius-lg); overflow: hidden;
 }
-.ds-table-wrap table { border-collapse: collapse; width: 100%; }
-.ds-table-wrap th, .ds-table-wrap td { padding: 8px 14px; text-align: left; border-bottom: 1px solid var(--border); }
-.ds-table-wrap tr:last-child td { border-bottom: none; }
-.ds-table-wrap th { color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
-.ds-table-wrap .ds-name { font-weight: 600; }
+.ds-matrix { border-collapse: collapse; width: 100%; min-width: max-content; }
+.ds-matrix th, .ds-matrix td { padding: 6px 14px; text-align: center; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.ds-matrix thead th { position: sticky; top: 0; background: var(--bg-sidebar); color: var(--fg-muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+.ds-matrix th { background: var(--bg-sidebar); font-weight: 600; }
+.ds-matrix .cell { font-size: 12px; }
+.cell.vs.ready { color: var(--ok); }
+.cell.vs.rendering { color: var(--warn); }
+.cell.vs.pending { color: var(--fg-muted); }
+.cell.vs.failed { color: var(--err); }
 .ds-table-wrap .ok { color: var(--ok); }
 .ds-table-wrap .warn { color: var(--warn); }
+.ds-table-wrap .muted { color: var(--fg-muted); }
 .ds-table-wrap .err { color: var(--err); }
-.ds-deck-head { padding: 8px 12px; font-weight: 600; border-bottom: 1px solid var(--border); }
-.deck-status {
-  display: flex; align-items: center; gap: 8px; padding: 6px 12px;
-  border-bottom: 1px solid var(--border);
+/* 侧栏渲染组管理 */
+.ds-sel-tip { padding: 6px 10px; font-size: 11px; color: var(--fg-muted); }
+.ds-item { display: flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: var(--radius); cursor: pointer; white-space: nowrap; }
+.ds-item:hover { background: var(--bg-hover); }
+.ds-item.rm { background: rgba(207, 34, 46, 0.14); }
+.ds-item.add { background: rgba(26, 127, 55, 0.14); }
+.ds-item input { accent-color: var(--accent); margin: 0; }
+.ds-side-btns { padding: 8px 10px; border-top: 1px solid var(--border); }
+.ds-side-btns button {
+  width: 100%; border: 1px solid var(--border); background: var(--bg-editor); color: var(--fg);
+  border-radius: var(--radius); padding: 6px 8px; font-size: 12px;
 }
-.deck-status:last-child { border-bottom: none; }
-.deck-status:hover { background: var(--bg-hover); }
-.deck-status .ds-deck-name { font-weight: 600; flex: none; }
-.deck-status .vs-row { display: flex; flex-wrap: wrap; gap: 4px 10px; }
-.vs { font-size: 11px; color: var(--fg-muted); }
-.vs.ready { color: var(--ok); }
-.vs.rendering { color: var(--warn); }
-.vs.pending { color: var(--fg-muted); }
-.vs.failed { color: var(--err); }
-/* 侧栏目录树 */
-.tree-node { margin-left: 2px; }
-.tree-row { display: flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: var(--radius-sm); white-space: nowrap; }
-.tree-dir { cursor: pointer; font-weight: 500; }
-.tree-row:hover { background: var(--bg-hover); }
-.tree-arrow { width: 12px; flex: none; text-align: center; color: var(--fg-muted); font-size: 10px; }
-.tree-file .tree-name { color: var(--fg-muted); }
-.tree-children { margin-left: 12px; }
+.ds-side-btns button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ds-side-btns button:disabled { opacity: 0.5; cursor: default; }
 
 /* statusbar */
 #statusbar {

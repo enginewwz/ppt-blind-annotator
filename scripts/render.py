@@ -77,10 +77,29 @@ def render_pdf_to_webp(pdf_path: Path, out_dir: Path, dpi: int, thumb_width: int
     return pages
 
 
+def _commit_staged_pages(stage: Path, out_dir: Path, pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把 staging 里渲染好的页面搬入最终目录：先搬入新文件（保证清单引用的文件一定存在），
+    再删除不再需要的旧页，避免留下半成品/碎片文件。"""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final = []
+    for p in pages:
+        final_src = out_dir / Path(p["src"]).name
+        final_thumb = out_dir / Path(p["thumb"]).name
+        shutil.move(p["src"], final_src)
+        shutil.move(p["thumb"], final_thumb)
+        final.append({"src": str(final_src), "thumb": str(final_thumb), "w": p["w"], "h": p["h"]})
+    wanted = {Path(p["src"]).name for p in pages} | {Path(p["thumb"]).name for p in pages}
+    for old in list(out_dir.glob("page_*.webp")) + list(out_dir.glob("thumb_*.webp")):
+        if old.name not in wanted:
+            old.unlink(missing_ok=True)
+    return final
+
+
 def render_version(args: dict) -> dict:
     """Worker：渲染单个 pptx 版本（独立 LO 用户目录，任务结束清理）。
 
-    返回: {"ok": bool, "pages": [...], "page_count": int, "error": str?}
+    先渲染到临时 staging 目录，全部成功才搬入最终目录；失败时 staging 随上下文自动清理，
+    绝不留下半成品页文件。返回: {"ok": bool, "pages": [...], "page_count": int, "error": str?}
     """
     file_path = Path(args["file_path"])
     out_dir = Path(args["out_dir"])
@@ -90,11 +109,14 @@ def render_version(args: dict) -> dict:
     if not file_path.is_file():
         return {"ok": False, "error": f"文件不存在: {file_path}"}
     try:
+        out_dir.parent.mkdir(parents=True, exist_ok=True)
         profile_dir = Path(tempfile.mkdtemp(prefix="lo_profile_"))
         try:
             with tempfile.TemporaryDirectory(prefix="pdf_tmp_") as tmp:
                 pdf = convert_pptx_to_pdf(soffice, file_path, Path(tmp), profile_dir)
-                pages = render_pdf_to_webp(pdf, out_dir, dpi, thumb_width)
+                with tempfile.TemporaryDirectory(prefix="stage_", dir=str(out_dir.parent)) as stage:
+                    pages = render_pdf_to_webp(pdf, Path(stage), dpi, thumb_width)
+                    pages = _commit_staged_pages(Path(stage), out_dir, pages)
         finally:
             shutil.rmtree(profile_dir, ignore_errors=True)
         return {"ok": True, "pages": pages, "page_count": len(pages)}

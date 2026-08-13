@@ -8,6 +8,7 @@ import argparse
 import json
 import multiprocessing as mp
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -237,6 +238,36 @@ def _render_job(job: tuple) -> tuple:
     return di, vi, render_version(args)
 
 
+def _cleanup_orphan_renders(manifest: dict) -> None:
+    """删除清单中已不再引用的渲染产物（数据集被移除、Deck 版本减少时），
+    避免 config 变更后磁盘残留碎片文件。"""
+    ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
+    referenced = {
+        paths.RENDERED_DIR / ds_name[v["dataset_id"]] / deck["name"]
+        for deck in manifest["decks"]
+        for v in deck["versions"]
+    }
+    if not paths.RENDERED_DIR.is_dir():
+        return
+    for ds_dir in sorted(paths.RENDERED_DIR.iterdir()):
+        if not ds_dir.is_dir():
+            continue
+        for deck_dir in sorted(ds_dir.iterdir()):
+            if deck_dir.is_dir() and deck_dir not in referenced:
+                shutil.rmtree(deck_dir, ignore_errors=True)
+                try:
+                    rel = deck_dir.relative_to(paths.PROJECT_ROOT)
+                except ValueError:
+                    rel = deck_dir
+                print(f"[ingest] 清理孤儿渲染产物: {rel}")
+        # 数据集目录被清空则一并移除
+        if not any(ds_dir.iterdir()):
+            try:
+                ds_dir.rmdir()
+            except OSError:
+                pass
+
+
 def run_render(
     cfg: dict,
     jobs: int,
@@ -248,6 +279,8 @@ def run_render(
     """执行一次渲染 pass：合并旧状态 → 标记渲染中 → 渲染 → 逐结果更新 manifest/status。"""
     manifest = build_or_merge_manifest(cfg)
     finalize_deck_statuses(manifest)
+    # config 变更后清理孤儿产物（在标记渲染中之前，不会误删本轮要渲染的目录）
+    _cleanup_orphan_renders(manifest)
 
     ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
     pending: list[tuple] = []
@@ -307,14 +340,48 @@ def run_render(
     return {"manifest": manifest, "status": status}
 
 
+def _config_fingerprint(config_path: Path) -> tuple:
+    """config.json 指纹 (mtime_ns, size)：未变化则不重读，缩小读写冲突窗口。"""
+    try:
+        st = config_path.stat()
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return (0, 0)
+
+
+def _load_config_retry(config_path: Path, attempts: int = 5, delay: float = 0.2) -> dict:
+    """读取 config.json；容忍浏览器写入期间的瞬态撕裂读（读到写一半的 JSON）。"""
+    import time
+
+    last_err: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return load_config(config_path)
+        except (json.JSONDecodeError, OSError, ValueError) as e:
+            last_err = e
+            time.sleep(delay)
+    raise RuntimeError(f"config.json 读取失败（重试 {attempts} 次）: {last_err}")
+
+
 def _watch_loop(args: argparse.Namespace) -> int:
     import time
 
     print(f"[ingest] watch 模式启动（间隔 {args.interval}s，Ctrl+C 停止）")
-    cfg0 = load_config(Path(args.config))
-    warn_missing_datasets(cfg0)
+    cfg_path = Path(args.config)
+    cfg = load_config(cfg_path)
+    warn_missing_datasets(cfg)
+    last_fp = _config_fingerprint(cfg_path)
     while True:
-        cfg = load_config(Path(args.config))
+        fp = _config_fingerprint(cfg_path)
+        if fp != last_fp:
+            try:
+                cfg = _load_config_retry(cfg_path)
+                last_fp = fp
+                warn_missing_datasets(cfg)
+            except Exception as e:  # noqa: BLE001
+                # 配置正在被写入：本轮跳过并保留上次成功配置；不更新 last_fp，
+                # 下一轮会重试读取——绝不用半个配置跑渲染，也就不产生半成品产物。
+                print(f"[ingest] config.json 变化但读取失败，跳过本轮: {e}")
         run_render(cfg, args.jobs, args.dpi, args.thumb_width, args.soffice, active=True)
         time.sleep(args.interval)
 

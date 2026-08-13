@@ -115,14 +115,31 @@ const FS = (() => {
     try { return JSON.parse(await readFileText(name)); } catch (_) { return null; }
   }
 
-  /* 原子写：写临时文件后 move 覆盖（FS Access 不支持 os.replace，用 move 近似） */
+  /* 原子写：优先 tmp+move（读者永远看到旧或新的完整文件）。
+     move 偶尔因目标被外部进程占用（如 ingest --watch 正读 config.json）失败，短暂重试；
+     仍失败才退回直接截断写（非原子，但后端读端已做重试+跳过容错）。写完清理 tmp 残留。 */
   async function writeJSONAtomic(name, obj) {
     const text = JSON.stringify(obj, null, 2) + "\n";
     const tmpName = name + ".tmp";
-    const tmpHandle = await dirHandle.getFileHandle(tmpName, { create: true });
-    const w = await tmpHandle.createWritable();
-    try { await w.write(text); await w.close(); } catch (e) { await w.abort(); throw e; }
-    await tmpHandle.move(name);
+    let wrote = false;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const tmpHandle = await dirHandle.getFileHandle(tmpName, { create: true });
+        const w = await tmpHandle.createWritable();
+        try { await w.write(text); await w.close(); } catch (e) { try { await w.abort(); } catch (_) {} throw e; }
+        await tmpHandle.move(name);
+        wrote = true;
+        break;
+      } catch (_) {
+        if (attempt < 2) await new Promise(r => setTimeout(r, 80));
+      }
+    }
+    if (!wrote) {
+      const fh = await dirHandle.getFileHandle(name, { create: true });
+      const w = await fh.createWritable();
+      try { await w.write(text); await w.close(); } catch (e) { try { await w.abort(); } catch (_) {} throw e; }
+    }
+    try { await dirHandle.removeEntry(tmpName); } catch (_) { /* tmp 已被 move 消耗则忽略 */ }
   }
 
   async function appendLine(name, line) {
@@ -147,6 +164,23 @@ const FS = (() => {
     return out;
   }
 
+  /* 确保相对路径目录存在（逐级创建），返回最后目录句柄（添加数据集用） */
+  async function ensureDir(relPath) {
+    let dh = dirHandle;
+    const parts = String(relPath).split("/").filter(Boolean);
+    for (const p of parts) dh = await dh.getDirectoryHandle(p, { create: true });
+    return dh;
+  }
+
+  /* 删除相对路径的目录（含其内容） */
+  async function removeDir(relPath) {
+    const parts = String(relPath).split("/").filter(Boolean);
+    const name = parts.pop();
+    let dh = dirHandle;
+    for (const p of parts) dh = await dh.getDirectoryHandle(p);
+    await dh.removeEntry(name, { recursive: true });
+  }
+
   /* 诊断信息：当前选中目录名 + 是否含关键文件 + 顶层条目列表。
      注：浏览器隐私限制，无法拿到绝对路径，只能拿到目录名（FileSystemHandle.name）。 */
   async function dirInfo() {
@@ -166,5 +200,5 @@ const FS = (() => {
     return info;
   }
 
-  return { hasSupport, getHandle, tryRestore, reSelect, readJSON, readFileText, writeJSONAtomic, appendLine, dirInfo, listDir };
+  return { hasSupport, getHandle, tryRestore, reSelect, readJSON, readFileText, writeJSONAtomic, appendLine, dirInfo, listDir, ensureDir, removeDir };
 })();

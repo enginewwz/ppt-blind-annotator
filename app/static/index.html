@@ -90,21 +90,25 @@
           <!-- 数据集视图 -->
           <div id="datasets" hidden>
             <div class="ds-toolbar">
-              <div class="seg" id="ds-view-seg">
-                <button data-view="deck" class="on">按 Deck 进度</button>
-                <button data-view="dataset">按数据集进度</button>
+              <label class="ds-ctl">纵轴
+                <select id="ds-axis">
+                  <option value="deck">Deck</option>
+                  <option value="dataset">数据源</option>
+                </select>
+              </label>
+              <div class="ms-wrap" id="ds-status-ms">
+                <button type="button" class="ms-btn" id="ds-status-btn">状态：全部</button>
+                <div class="ms-panel" hidden>
+                  <label><input type="checkbox" data-st="all" checked> 全部</label>
+                  <label><input type="checkbox" data-st="ready"> 就绪</label>
+                  <label><input type="checkbox" data-st="rendering"> 渲染中</label>
+                  <label><input type="checkbox" data-st="pending"> 待处理</label>
+                  <label><input type="checkbox" data-st="failed"> 失败</label>
+                </div>
               </div>
-              <span class="spacer"></span>
-              <div class="seg" id="ds-filter-seg">
-                <button data-st="all" class="on">全部</button>
-                <button data-st="ready">就绪</button>
-                <button data-st="rendering">渲染中</button>
-                <button data-st="pending">待处理</button>
-                <button data-st="failed">失败</button>
-              </div>
+              <button type="button" id="ds-refresh" title="重新加载 manifest/状态（如添加数据源后）">⟳ 刷新</button>
             </div>
             <div id="ds-content"></div>
-            <p class="muted">新增/修改输入目录：编辑 <code>data/config.json</code> 后重跑 <code>scripts/ingest.py</code>（增量自动补渲染）。</p>
           </div>
 
           <!-- 报告视图（M3 实现） -->

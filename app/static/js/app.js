@@ -1,11 +1,5 @@
 /* 应用主入口：初始化、路由、数据加载、动态轮询、标注保存/导入导出。 */
 
-/* 分段选择器：让 #segId 里 data[key]===val 的按钮高亮 */
-function segSelect(segId, key, val) {
-  document.querySelectorAll(`#${segId} button`).forEach((b) =>
-    b.classList.toggle("on", b.dataset[key] === val));
-}
-
 /* 轻量操作日志：localStorage 存储，自动裁剪上限（有主动清理） */
 const OpLog = {
   key: "ppt.oplog",
@@ -25,106 +19,224 @@ function escapeHtml(s) {
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-/* 数据页左侧：真实的目录树（可展开/收纳，含 config 等文件） */
-const FolderTree = {
-  async render(el) {
+/* 绝对路径公共前缀（用于定位数据集容器目录） */
+function absCommonPrefix(paths) {
+  if (!paths.length) return "";
+  let p = paths[0].split("/").filter(Boolean);
+  paths.slice(1).forEach((s) => {
+    const q = s.split("/").filter(Boolean);
+    let i = 0;
+    while (i < p.length && i < q.length && p[i] === q[i]) i++;
+    p = p.slice(0, i);
+  });
+  return "/" + p.join("/");
+}
+
+/* 在 data/ 目录树下按名称查找目录，返回相对路径（跳过 rendered/，限制深度） */
+async function findDirRel(targetName, maxDepth = 4) {
+  const queue = [""];
+  while (queue.length) {
+    const cur = queue.shift();
+    const depth = cur ? cur.split("/").length : 0;
+    if (depth > maxDepth) continue;
     let entries;
-    try { entries = await FS.listDir(""); }
-    catch (_) { el.innerHTML = '<div class="empty muted">无法读取目录</div>'; return; }
-    el.innerHTML = entries.map((e) => this.row(e, "")).join("");
-    el.onclick = (ev) => {
-      const row = ev.target.closest(".tree-dir");
-      if (!row) return;
-      const node = row.parentElement;
-      const kids = node.querySelector(":scope > .tree-children");
-      const arrow = row.querySelector(".tree-arrow");
-      if (!kids) return;
-      if (kids.dataset.loaded) {
-        kids.hidden = !kids.hidden;
-        arrow.textContent = kids.hidden ? "▸" : "▾";
-        return;
-      }
-      const path = row.dataset.path;
-      arrow.textContent = "…";
-      FS.listDir(path).then((es) => {
-        kids.innerHTML = es.map((e) => this.row(e, path)).join("");
-        kids.dataset.loaded = "1";
-        kids.hidden = false;
-        arrow.textContent = "▾";
-      }).catch(() => { arrow.textContent = "▸"; });
-    };
-  },
-  row(e, parent) {
-    const full = parent ? parent + "/" + e.name : e.name;
-    if (e.kind === "directory") {
-      return `<div class="tree-node">
-        <div class="tree-row tree-dir" data-path="${escapeHtml(full)}">
-          <span class="tree-arrow">▸</span><span class="tree-name">${escapeHtml(e.name)}</span>
-        </div>
-        <div class="tree-children" hidden></div>
-      </div>`;
+    try { entries = await FS.listDir(cur); } catch (_) { continue; }
+    for (const e of entries) {
+      if (e.kind !== "directory") continue;
+      if (e.name === "rendered") continue;
+      if (e.name === targetName) return cur ? cur + "/" + e.name : e.name;
+      queue.push(cur ? cur + "/" + e.name : e.name);
     }
-    return `<div class="tree-row tree-file">
-      <span class="tree-arrow"></span><span class="tree-name">${escapeHtml(e.name)}</span>
-    </div>`;
-  },
-};
+  }
+  return null;
+}
+
+const DS_LABEL = { ready: "就绪", rendering: "渲染中", pending: "待处理", failed: "失败" };
 
 const Datasets = {
-  filter: "all",       // all | ready | rendering | pending | failed
-  view: "deck",        // deck | dataset
+  statuses: new Set(),  // 空集合 = 全部
+  axis: "deck",         // deck | dataset（纵轴）
+  rendered: [],         // 正在渲染的文件夹名（来自 config.json）
+  candidates: [],       // 备选文件夹名（容器内未在渲染的）
+  addSet: new Set(),    // 勾选要加入渲染的备选
+  rmSet: new Set(),     // 勾选要取消渲染的现有组
+
+  async loadSidebar() {
+    let cfg = null;
+    try { cfg = await FS.readJSON("config.json"); } catch (_) { /* ignore */ }
+    this.cfg = cfg || { datasets: [] };
+    this.rendered = (this.cfg.datasets || []).map((d) => d.name);
+    this.candidates = [];
+    const cfgDs = this.cfg.datasets || [];
+    if (cfgDs.length) {
+      try {
+        const relFirst = await findDirRel(cfgDs[0].name);
+        if (relFirst) {
+          const relContainer = relFirst.split("/").slice(0, -1).join("/");
+          const entries = await FS.listDir(relContainer);
+          this.candidates = entries.filter((e) => e.kind === "directory").map((e) => e.name)
+            .filter((n) => !this.rendered.includes(n));
+        }
+      } catch (_) { /* ignore */ }
+    }
+  },
 
   async renderSidebar() {
-    FolderTree.render(document.getElementById("dataset-list"));
+    const el = document.getElementById("dataset-list");
+    await this.loadSidebar();
+    const item = (group, nm, checked, extra) =>
+      `<label class="ds-item ${extra}">
+        <input type="checkbox" data-group="${group}" data-name="${escapeHtml(nm)}" ${checked ? "checked" : ""}>
+        <span>${escapeHtml(nm)}</span>
+      </label>`;
+    const renderedHtml = this.rendered.map((n) =>
+      item("rm", n, this.rmSet.has(n), this.rmSet.has(n) ? "rm" : "")).join("") ||
+      '<div class="empty muted">（暂无渲染中的组）</div>';
+    const candHtml = this.candidates.map((n) =>
+      item("add", n, this.addSet.has(n), this.addSet.has(n) ? "add" : "")).join("") ||
+      '<div class="empty muted">（无备选文件夹）</div>';
+    const dirty = this.addSet.size + this.rmSet.size > 0;
+    el.innerHTML =
+      `<div class="ds-sel-tip muted">正在渲染（勾选以取消渲染）</div>${renderedHtml}` +
+      `<div class="ds-sel-tip muted">备选文件夹（勾选以加入渲染）</div>${candHtml}` +
+      `<div class="ds-side-btns"><button id="ds-commit" class="${dirty ? "primary" : ""}" ${dirty ? "" : "disabled"}>提交修改${dirty ? `（${this.addSet.size + this.rmSet.size}）` : ""}</button></div>`;
+    el.querySelectorAll(".ds-item input").forEach((cb) =>
+      cb.addEventListener("change", () => {
+        const nm = cb.dataset.name;
+        if (cb.dataset.group === "rm") { if (cb.checked) this.rmSet.add(nm); else this.rmSet.delete(nm); }
+        else { if (cb.checked) this.addSet.add(nm); else this.addSet.delete(nm); }
+        this.renderSidebar();
+      }));
+    document.getElementById("ds-commit").addEventListener("click", () => this.commit());
   },
 
   async render() {
     this.renderSidebar();
+    this.syncControls();
     const ds = App.state.datasets || [];
     const decks = App.state.decks || [];
     document.getElementById("ds-content").innerHTML =
-      this.view === "dataset" ? this.datasetTable(ds, decks) : this.deckList(decks);
+      this.axis === "dataset" ? this.datasetTable(ds, decks) : this.deckMatrix(ds, decks);
   },
 
+  /* 纵轴=Deck：行=Deck，横轴=各数据源（method…），格内为对应版本状态 */
+  deckMatrix(ds, decks) {
+    let list = decks.slice();
+    if (this.statuses.size) list = list.filter((d) => this.statuses.has(d.status));
+    const head = `<tr><th>Deck</th>${ds.map((d) => `<th>${escapeHtml(d.name)}</th>`).join("")}</tr>`;
+    const rows = list.map((d) => {
+      const cells = ds.map((dsobj) => {
+        const v = d.versions.find((x) => x.dataset_id === dsobj.id);
+        if (!v) return `<td class="cell">-</td>`;
+        const label = v.status === "ready" ? (v.page_count || 0) + "p"
+          : v.status === "rendering" ? "渲染中" : v.status === "failed" ? "失败" : "待处理";
+        return `<td class="cell vs ${v.status}">${label}</td>`;
+      }).join("");
+      return `<tr><th>${escapeHtml(d.name)}</th>${cells}</tr>`;
+    }).join("");
+    return `<div class="ds-scroll"><div class="ds-table-wrap"><table class="ds-matrix"><thead>${head}</thead><tbody>${rows}</tbody></table></div></div>`;
+  },
+
+  /* 纵轴=数据源：行=数据源，列为各状态计数 */
   datasetTable(ds, decks) {
     if (!ds.length) return '<div class="empty muted">暂无数据集。请配置 data/config.json 并运行 ingest。</div>';
     const rows = ds.map((d) => {
       const dds = decks.filter((k) => k.versions.some((v) => v.dataset_id === d.id));
       const ready = dds.filter((k) => k.status === "ready").length;
       const rendering = dds.filter((k) => k.status === "rendering").length;
+      const pending = dds.filter((k) => k.status === "pending").length;
       const failed = dds.filter((k) => k.status === "failed").length;
-      return `<tr><td class="ds-name">${d.name}</td><td>${dds.length}</td>
-        <td class="ok">${ready}</td><td class="warn">${rendering}</td><td class="err">${failed}</td></tr>`;
+      return `<tr><th>${escapeHtml(d.name)}</th><td>${dds.length}</td><td class="ok">${ready}</td><td class="warn">${rendering}</td><td class="muted">${pending}</td><td class="err">${failed}</td></tr>`;
     }).join("");
-    return `<div class="ds-table-wrap"><table>
-      <tr><th>数据集</th><th>Deck 数</th><th>就绪</th><th>渲染中</th><th>失败</th></tr>${rows}
-    </table></div>`;
+    return `<div class="ds-scroll"><div class="ds-table-wrap"><table class="ds-matrix"><thead><tr><th>数据源</th><th>Deck 数</th><th>就绪</th><th>渲染中</th><th>待处理</th><th>失败</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
   },
 
-  deckList(decks) {
-    let list = decks.slice();
-    if (this.filter !== "all") list = list.filter((d) => d.status === this.filter);
-    const dsName = (id) => (App.state.datasets.find((x) => x.id === id) || {}).name || String(id);
-    return `<div class="ds-table-wrap"><div class="ds-deck-head">Deck 进度（${list.length}/${decks.length}）</div>` +
-      (list.length ? list.map((d) => {
-        const vs = d.versions.map((v) =>
-          `<span class="vs ${v.status}">${dsName(v.dataset_id)} · ${v.status === "ready" ? (v.page_count || 0) + "p" : v.status}</span>`).join(" ");
-        return `<div class="deck-status">
-          <span class="dot ${d.status}"></span>
-          <span class="ds-deck-name">${d.name}</span>
-          <span class="vs-row">${vs}</span>
-        </div>`;
-      }).join("") : '<div class="empty muted">无匹配的 Deck</div>') + '</div>';
+  /* ---- 提交修改：一次性写 config.json（增/删渲染组），避免频繁写盘卡顿 ---- */
+  async commit() {
+    if (!this.addSet.size && !this.rmSet.size) return;
+    try {
+      const cfg = (await FS.readJSON("config.json")) || { datasets: [] };
+      let ds = cfg.datasets || [];
+      // 取消渲染：从配置移除（不删物理文件夹）
+      if (this.rmSet.size) ds = ds.filter((d) => !this.rmSet.has(d.name));
+      // 加入渲染：把备选文件夹写进配置
+      if (this.addSet.size) {
+        const allPaths = (cfg.datasets || []).map((d) => d.path);
+        const parentAbs = absCommonPrefix(allPaths);
+        let maxOrder = Math.max(-1, ...ds.map((d) => d.sort_order ?? -1));
+        const existing = new Set(ds.map((d) => d.name));
+        for (const nm of this.addSet) {
+          if (existing.has(nm)) continue;
+          ds.push({ name: nm, path: (parentAbs || "") + "/" + nm, sort_order: ++maxOrder });
+          existing.add(nm);
+        }
+      }
+      cfg.datasets = ds;
+      await FS.writeJSONAtomic("config.json", cfg);
+      this.addSet.clear();
+      this.rmSet.clear();
+      await this.renderSidebar();
+      this.render();
+      alert("已提交修改并写入 config.json。\n（若 ingest 以 --watch 运行，会自动开始/停止对应组的渲染；否则请运行 python -m scripts.ingest --watch）");
+    } catch (e) { alert("提交失败：" + e.message); }
   },
 
-  setFilter(f) { this.filter = f; segSelect("ds-filter-seg", "st", f); this.render(); },
-  setView(v) { this.view = v; segSelect("ds-view-seg", "view", v); this.render(); },
+  /* 同步控制条：纵轴下拉值 + 状态多选勾选/按钮文案 */
+  syncControls() {
+    const axisSel = document.getElementById("ds-axis");
+    if (axisSel) axisSel.value = this.axis;
+    const ms = document.getElementById("ds-status-ms");
+    if (!ms) return;
+    ms.querySelectorAll("input[data-st]").forEach((cb) => {
+      cb.checked = cb.dataset.st === "all"
+        ? this.statuses.size === 0
+        : this.statuses.has(cb.dataset.st);
+    });
+    const btn = document.getElementById("ds-status-btn");
+    if (btn) {
+      btn.textContent = this.statuses.size
+        ? "状态：" + [...this.statuses].map((s) => DS_LABEL[s] || s).join("、")
+        : "状态：全部";
+    }
+  },
+
+  setAxis(a) { this.axis = a; this.syncControls(); this.render(); },
+
+  onStatusToggle(cb) {
+    const st = cb.dataset.st;
+    if (st === "all") {
+      if (cb.checked) { this.statuses.clear(); this.render(); }
+      return;
+    }
+    if (cb.checked) this.statuses.add(st); else this.statuses.delete(st);
+    this.render();   // 空集合 = 全部；syncControls 会把「全部」重新勾上
+  },
+
+  async refresh() {
+    // 添加数据源/手动改 config 后：重新拉取 manifest 与标注并重绘
+    await App.refreshManifest();
+    await App.refreshAnnotations();
+    this.render();
+    OpLog.add("刷新数据页");
+  },
 
   bind() {
-    document.querySelectorAll("#ds-filter-seg button").forEach((b) =>
-      b.addEventListener("click", () => this.setFilter(b.dataset.st)));
-    document.querySelectorAll("#ds-view-seg button").forEach((b) =>
-      b.addEventListener("click", () => this.setView(b.dataset.view)));
+    document.getElementById("ds-axis").addEventListener("change", (e) => this.setAxis(e.target.value));
+    document.querySelectorAll("#ds-status-ms input[data-st]").forEach((cb) =>
+      cb.addEventListener("change", () => this.onStatusToggle(cb)));
+    document.getElementById("ds-status-btn").addEventListener("click", (e) => {
+      e.stopPropagation();
+      const p = document.getElementById("ds-status-ms").querySelector(".ms-panel");
+      if (p) p.hidden = !p.hidden;
+    });
+    document.addEventListener("click", (e) => {
+      const ms = document.getElementById("ds-status-ms");
+      if (ms && !ms.contains(e.target)) {
+        const p = ms.querySelector(".ms-panel");
+        if (p) p.hidden = true;
+      }
+    });
+    document.getElementById("ds-refresh").addEventListener("click", () => this.refresh());
   },
 };
 
