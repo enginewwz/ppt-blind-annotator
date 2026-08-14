@@ -84,6 +84,19 @@ def main() -> int:
                 add_slide(prs, method, deck_name, pi, color)
             prs.save(mdir / f"{deck_name}.pptx")
             print(f"[make_demo] {method}/{deck_name}.pptx ({pages} 页)")
+    # 生成自描述的 data/config.json（data/ 视为「外部目录」：data_dir 指向自身）
+    from scripts.atomic import atomic_write_json  # noqa: E402
+
+    cfg = {
+        "data_dir": str(paths.DATA_DIR),
+        "datasets": [
+            {"name": m, "path": f"demo/{m}", "sort_order": i}
+            for i, m in enumerate(METHODS)
+        ],
+        "prefs": {"shuffle": False, "sync_page": True},
+    }
+    atomic_write_json(paths.DATA_DIR / "config.json", cfg)
+    print(f"[make_demo] config.json -> {paths.DATA_DIR / 'config.json'}（data_dir={cfg['data_dir']}）")
     print("[make_demo] 完成：4 组样例已生成。")
     return 0
 

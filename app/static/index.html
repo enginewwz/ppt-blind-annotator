@@ -42,7 +42,13 @@
           </select>
         </div>
         <div id="deck-list" class="list"></div>
-        <div id="dataset-list" class="list" hidden></div>
+        <div id="dataset-list" class="list" hidden>
+          <div class="ds-dir-bar">
+            <span class="muted">目录</span>
+            <button type="button" id="ds-dir-refresh" title="增量扫描备选文件夹（外部拖入新文件夹后点此刷新）">⟳ 刷新</button>
+          </div>
+          <div id="dataset-dir"></div>
+        </div>
       </aside>
 
       <div id="splitter" title="拖动调整目录宽度"></div>
@@ -109,6 +115,9 @@
                 </div>
               </div>
               <button type="button" id="ds-refresh" title="重新加载 manifest/状态（如添加数据源后）">⟳ 刷新</button>
+              <span class="sep"></span>
+              <button type="button" id="ds-import" title="把当前 data 目录的 config 复制到工作区 config（ingest 始终监听工作区 config；需 launch.py 启动）">⇥ 复制到工作区</button>
+              <button type="button" id="ds-export" title="把工作区 config 写回当前 data 目录的 config.json">⇤ 写回目录</button>
             </div>
             <div id="ds-content"></div>
           </div>

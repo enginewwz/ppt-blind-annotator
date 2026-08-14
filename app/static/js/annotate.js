@@ -23,6 +23,7 @@ const Annotate = (() => {
   }
 
   function openDeck(deck, opts) {
+    clearImageCache();   // 换 Deck/换目录：清 URL 并重置路径标记，卡片重新拉取最新图
     const sameDeck = !!(st && st.deck && st.deck.id === deck.id);
     const noShuffle = !!(opts && opts.noShuffle);
     // 保留上一个 Deck 的布局样式（列数/按列模式/卡片位置与大小），切到不同 Deck 沿用
@@ -621,6 +622,13 @@ const Annotate = (() => {
              nw: "nwse-resize", se: "nwse-resize", ne: "nesw-resize", sw: "nesw-resize" }[dir] || "move";
   }
 
+  /* 清图片缓存：撤销 Blob URL 并清除 img 上的 currentPath 标记，使所有卡片在下次 refreshSrc 时重新拉取。
+     只清 URL 不清 currentPath 会让「已撤销 URL 的图」因路径未变而跳过重载 → 显示破碎图标（如换目录/换 Deck 后）。 */
+  function clearImageCache() {
+    if (FS.clearUrlCache) FS.clearUrlCache();
+    document.querySelectorAll("#board .col .slide").forEach((img) => { delete img.dataset.currentPath; });
+  }
+
   function updateImages() {
     if (!st) return;
     document.querySelectorAll("#board .col").forEach((col) => {
@@ -640,35 +648,41 @@ const Annotate = (() => {
       }
       const pg = v.pages[Math.min(curPage(i), v.pages.length - 1)];
       img.style.display = "";
-      img.dataset.thumb = App.imgSrc(pg.thumb);
-      img.dataset.full = App.imgSrc(pg.src);
+      img.dataset.thumbPath = pg.thumb;   // manifest 内相对所选 data 目录的路径
+      img.dataset.fullPath = pg.src;
       img.dataset.pgW = String(pg.w || 0);
-      // 不重置 current：换页/换图时 URL 变化，refreshSrc 自然重载；
+      // 不重置 current：换页/换图时路径变化，refreshSrc 自然重载；
       // 同图时不重复赋值 src，避免反复重载图片
-      refreshSrc(img);
+      refreshSrc(img).catch(() => {});
     });
   }
 
   /* 显示宽度超过缩略图原始大小（或超过原图 50%）时用原图，否则用缩略图；每次换页/换 Deck/缩放都重新判断 */
-  function refreshSrc(img) {
+  async function refreshSrc(img) {
     const col = img.closest(".col");
     const body = col && col.querySelector(".col-body");
     const pgW = Number(img.dataset.pgW) || 0;
     const dispW = body ? body.clientWidth : 0;
     // 记住缩略图原始宽度：当前正显示缩略图时读取 naturalWidth
-    if (img.dataset.current === img.dataset.thumb && img.naturalWidth) {
+    if (img.dataset.currentPath === img.dataset.thumbPath && img.naturalWidth) {
       img.dataset.thumbW = String(img.naturalWidth);
     }
     const thumbW = Number(img.dataset.thumbW) || 0;
     const useFull = pgW && ((thumbW && dispW > thumbW) || dispW / pgW > FULL_RATIO);
-    const want = useFull ? img.dataset.full : img.dataset.thumb;
-    if (want && img.dataset.current !== want) {
-      img.dataset.current = want;
-      img.src = want;
+    const path = useFull ? img.dataset.fullPath : img.dataset.thumbPath;
+    if (path && img.dataset.currentPath !== path) {
+      img.dataset.currentPath = path;
+      try {
+        const url = await FS.fileUrl(path);   // 经所选目录句柄读图 → Blob URL（任意路径可用）
+        if (img.dataset.currentPath !== path) return;   // 期间已切到别的页/图
+        img.src = url;
+      } catch (_) { /* 图片缺失：保持空白 */ }
     }
   }
   function refreshAllSrc() {
-    document.querySelectorAll("#board .col .slide").forEach(refreshSrc);
+    document.querySelectorAll("#board .col .slide").forEach((img) => {
+      refreshSrc(img).catch(() => {});
+    });
   }
 
   function onColClick(ev) {
@@ -714,9 +728,11 @@ const Annotate = (() => {
   }
 
   function toggleFull(img) {
-    if (!st || !img.dataset.full) return;
+    if (!st || !img.dataset.fullPath) return;
     const lb = document.getElementById("lightbox");
-    document.getElementById("lightbox-img").src = img.dataset.full;
+    FS.fileUrl(img.dataset.fullPath).then((url) => {
+      document.getElementById("lightbox-img").src = url;
+    }).catch(() => {});
     lb.hidden = false;
   }
 
@@ -813,6 +829,7 @@ const Annotate = (() => {
 
   function refreshStatus(deck) {
     if (st && st.deck.id === deck.id) {
+      clearImageCache();   // 状态刷新：取最新渲染的图片
       const prevCount = st.deck.versions.length;
       const wasReady = st.deck.status === "ready";
       st.deck = deck;

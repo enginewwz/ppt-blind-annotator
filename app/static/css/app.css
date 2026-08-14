@@ -288,7 +288,23 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
   background: transparent; color: var(--fg); font-size: 12px;   /* 无衬底黑字，自然高度 */
 }
 #ds-refresh:hover { color: var(--accent); }
+/* 数据页：把当前目录 config 复制到工作区 / 写回目录 */
+#ds-import, #ds-export {
+  padding: 4px 6px; border: none;
+  background: transparent; color: var(--fg); font-size: 12px; white-space: nowrap;
+}
+#ds-import:hover, #ds-export:hover { color: var(--accent); }
 #ds-content { flex: 1; min-height: 0; overflow: auto; padding: 12px 16px; }
+/* 数据页：后端未运行/未监听提示条 */
+.ds-hint {
+  padding: 6px 10px; margin-bottom: 10px; font-size: 12px; line-height: 1.6;
+  color: var(--warn); background: var(--bg-err-soft); border: 1px solid var(--border);
+  border-radius: var(--radius); word-break: break-all;
+}
+.ds-hint code {
+  background: var(--bg-hover); color: var(--fg); padding: 0 4px;
+  border-radius: var(--radius-sm);
+}
 .ds-scroll { overflow: auto; min-width: 0; }
 .ds-table-wrap {
   background: var(--bg-sidebar); border: 1px solid var(--border);
@@ -321,6 +337,19 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 }
 .ds-side-btns button.primary { background: var(--accent); color: var(--fg-on-accent); }   /* 提交保留主题色 */
 .ds-side-btns button:disabled { opacity: 0.5; cursor: default; }
+
+/* 侧栏「目录」栏：标题 + 增量刷新按钮 */
+.ds-dir-bar {
+  position: sticky; top: 0; z-index: 10;
+  display: flex; align-items: center; gap: 6px;
+  margin: -4px -6px 4px; padding: 4px 10px; font-size: 11px; color: var(--fg-muted);
+  border-bottom: 1px solid var(--border); background: var(--bg-panel);
+}
+#ds-dir-refresh {
+  margin-left: auto; padding: 2px 6px; border: none;
+  background: transparent; color: var(--fg); font-size: 12px;
+}
+#ds-dir-refresh:hover { color: var(--accent); }
 
 /* statusbar */
 #statusbar {

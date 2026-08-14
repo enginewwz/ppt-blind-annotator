@@ -51,7 +51,17 @@ def scan_pptx(dir_path: Path) -> list[Path]:
     )
 
 
-def group_decks(datasets: list[dict]) -> list[dict]:
+def _resolve_ds_path(config_path: Path, raw: str, data_dir: Path | None = None) -> Path:
+    """数据集路径：绝对路径直接用；相对路径以数据根为准（data_dir 优先，否则以
+    配置文件所在目录），使 config 里的相对路径在「重定向到外部目录」时也能解析。"""
+    p = Path(raw)
+    if p.is_absolute():
+        return p
+    base = data_dir if data_dir is not None else config_path.parent
+    return base / p
+
+
+def group_decks(datasets: list[dict], config_path: Path, data_dir: Path | None = None) -> list[dict]:
     """按文件名（去扩展名）把跨数据集的 ppt 归组为 Deck。
 
     返回: [{"name": ..., "versions": [{"dataset_name", "file_path"}]}]
@@ -59,7 +69,7 @@ def group_decks(datasets: list[dict]) -> list[dict]:
     decks: dict[str, dict[str, Any]] = {}
     for ds in datasets:
         ds_name = str(ds["name"])
-        ds_path = Path(str(ds["path"]))
+        ds_path = _resolve_ds_path(config_path, str(ds["path"]), data_dir)
         for f in scan_pptx(ds_path):
             stem = f.stem
             deck = decks.setdefault(stem, {"name": stem, "versions": []})
@@ -70,8 +80,10 @@ def group_decks(datasets: list[dict]) -> list[dict]:
     return list(decks.values())
 
 
-def build_manifest(cfg: dict) -> dict:
+def build_manifest(cfg: dict, config_path: Path, data_dir: Path | None = None) -> dict:
     """构建 manifest：数据集分配 id；Deck/版本初始为 pending。"""
+    if data_dir is None:
+        data_dir = _dirs_from_config(config_path, cfg)[0]
     datasets = cfg["datasets"]
     datasets_out = [
         {"id": i + 1, "name": str(ds["name"]), "sort_order": int(ds.get("sort_order", i))}
@@ -80,7 +92,7 @@ def build_manifest(cfg: dict) -> dict:
     ds_id_by_name = {d["name"]: d["id"] for d in datasets_out}
 
     decks_out: list[dict[str, Any]] = []
-    for deck in group_decks(datasets):
+    for deck in group_decks(datasets, config_path, data_dir):
         versions = [
             {
                 "dataset_id": ds_id_by_name[v["dataset_name"]],
@@ -121,32 +133,48 @@ def build_status(manifest: dict) -> dict:
     }
 
 
+def _dirs_from_config(config_path: Path, cfg: dict) -> tuple[Path, Path, Path]:
+    """数据根目录：config 里的 data_dir 可把输出重定向到外部 data 目录（前端把外部 config
+    复制到工作区 config 时自动带上，避免写死每条路径）；否则以 config 所在目录为根。
+    meta/、rendered/ 都写到该根下，前端经其句柄直读。"""
+    raw = cfg.get("data_dir")
+    if raw:
+        data_dir = Path(str(raw))
+        if not data_dir.is_absolute():
+            data_dir = config_path.parent / data_dir
+    else:
+        data_dir = config_path.parent
+    return data_dir, data_dir / "meta", data_dir / "rendered"
+
+
 def run(config_path: Path) -> dict:
     """M0：扫描 + 归组 + 生成 pending 清单（不渲染）。保留用于快速预览/测试。"""
     cfg = load_config(config_path)
-    manifest = build_manifest(cfg)
+    manifest = build_manifest(cfg, config_path)
     status = build_status(manifest)
-    paths.META_DIR.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(paths.MANIFEST_PATH, manifest)
-    atomic_write_json(paths.STATUS_PATH, status)
+    _, meta_dir, _ = _dirs_from_config(config_path, cfg)
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(meta_dir / "manifest.json", manifest)
+    atomic_write_json(meta_dir / "status.json", status)
     return {"manifest": manifest, "status": status, "config": cfg}
 
 
 # ---------------- M1：渲染管线 ----------------
 
 
-def load_existing_manifest() -> dict | None:
+def load_existing_manifest(manifest_path: Path) -> dict | None:
     """读取现有 manifest（无则返回 None）。"""
-    if paths.MANIFEST_PATH.is_file():
-        with open(paths.MANIFEST_PATH, encoding="utf-8") as f:
+    if manifest_path.is_file():
+        with open(manifest_path, encoding="utf-8") as f:
             return json.load(f)
     return None
 
 
-def build_or_merge_manifest(cfg: dict) -> dict:
+def build_or_merge_manifest(cfg: dict, config_path: Path, manifest_path: Path,
+                            data_dir: Path | None = None) -> dict:
     """用当前扫描结果重建清单，并把旧清单中「源文件未变且已就绪」的版本带过来（增量/断点续跑）。"""
-    manifest = build_manifest(cfg)
-    old = load_existing_manifest()
+    manifest = build_manifest(cfg, config_path, data_dir)
+    old = load_existing_manifest(manifest_path)
     if old and isinstance(old.get("version"), int):
         # 保持 version 单调递增（前端据此判断是否变化）
         manifest["version"] = old["version"]
@@ -216,19 +244,22 @@ def build_status_from_manifest(manifest: dict, active: bool) -> dict:
     }
 
 
-def warn_missing_datasets(cfg: dict) -> None:
+def warn_missing_datasets(cfg: dict, config_path: Path, data_dir: Path | None = None) -> None:
     """数据集路径不存在时打印警告，避免静默清空清单。"""
+    if data_dir is None:
+        data_dir = _dirs_from_config(config_path, cfg)[0]
     for ds in cfg.get("datasets", []):
-        if not Path(str(ds["path"])).is_dir():
+        if not _resolve_ds_path(config_path, str(ds["path"]), data_dir).is_dir():
             print(f"[ingest] 警告: 数据集 '{ds['name']}' 路径不存在: {ds['path']}")
 
 
-def _persist(manifest: dict, active: bool) -> dict:
+def _persist(manifest: dict, active: bool, meta_dir: Path) -> dict:
     """原子写 manifest + status（version 自增），返回 status。"""
+    meta_dir.mkdir(parents=True, exist_ok=True)
     manifest["version"] = int(manifest.get("version", 0)) + 1
-    atomic_write_json(paths.MANIFEST_PATH, manifest)
+    atomic_write_json(meta_dir / "manifest.json", manifest)
     status = build_status_from_manifest(manifest, active)
-    atomic_write_json(paths.STATUS_PATH, status)
+    atomic_write_json(meta_dir / "status.json", status)
     return status
 
 
@@ -238,18 +269,18 @@ def _render_job(job: tuple) -> tuple:
     return di, vi, render_version(args)
 
 
-def _cleanup_orphan_renders(manifest: dict) -> None:
+def _cleanup_orphan_renders(manifest: dict, rendered_dir: Path) -> None:
     """删除清单中已不再引用的渲染产物（数据集被移除、Deck 版本减少时），
     避免 config 变更后磁盘残留碎片文件。"""
     ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
     referenced = {
-        paths.RENDERED_DIR / ds_name[v["dataset_id"]] / deck["name"]
+        rendered_dir / ds_name[v["dataset_id"]] / deck["name"]
         for deck in manifest["decks"]
         for v in deck["versions"]
     }
-    if not paths.RENDERED_DIR.is_dir():
+    if not rendered_dir.is_dir():
         return
-    for ds_dir in sorted(paths.RENDERED_DIR.iterdir()):
+    for ds_dir in sorted(rendered_dir.iterdir()):
         if not ds_dir.is_dir():
             continue
         for deck_dir in sorted(ds_dir.iterdir()):
@@ -270,17 +301,22 @@ def _cleanup_orphan_renders(manifest: dict) -> None:
 
 def run_render(
     cfg: dict,
+    config_path: Path,
     jobs: int,
     dpi: int,
     thumb_width: int,
     soffice: str,
     active: bool,
 ) -> dict:
-    """执行一次渲染 pass：合并旧状态 → 标记渲染中 → 渲染 → 逐结果更新 manifest/status。"""
-    manifest = build_or_merge_manifest(cfg)
+    """执行一次渲染 pass：合并旧状态 → 标记渲染中 → 渲染 → 逐结果更新 manifest/status。
+
+    输出目录跟随 config 所在目录（meta/、rendered/ 都写到所选 data 目录内）。"""
+    data_dir, meta_dir, rendered_dir = _dirs_from_config(config_path, cfg)
+    manifest_path = meta_dir / "manifest.json"
+    manifest = build_or_merge_manifest(cfg, config_path, manifest_path, data_dir)
     finalize_deck_statuses(manifest)
     # config 变更后清理孤儿产物（在标记渲染中之前，不会误删本轮要渲染的目录）
-    _cleanup_orphan_renders(manifest)
+    _cleanup_orphan_renders(manifest, rendered_dir)
 
     ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
     pending: list[tuple] = []
@@ -288,7 +324,7 @@ def run_render(
         for vi, v in enumerate(deck["versions"]):
             if v.get("status") == STATUS_READY:
                 continue
-            out_dir = paths.RENDERED_DIR / ds_name[v["dataset_id"]] / deck["name"]
+            out_dir = rendered_dir / ds_name[v["dataset_id"]] / deck["name"]
             pending.append((di, vi, {
                 "file_path": v["file_path"],
                 "out_dir": str(out_dir),
@@ -300,13 +336,13 @@ def run_render(
 
     # 无变化（无待渲染且 manifest 与磁盘一致）→ 不写盘，保持 version 稳定。
     # 前端固定 1s 轮询 status：version 只在真有变化时 +1，避免空转反复重读大 manifest。
-    old = load_existing_manifest()
+    old = load_existing_manifest(manifest_path)
     if not pending and old is not None and old == manifest:
         return {"manifest": manifest, "status": build_status_from_manifest(manifest, active)}
 
     # 先落一次「渲染中」，前端可立即看到
     finalize_deck_statuses(manifest)
-    _persist(manifest, active)
+    _persist(manifest, active, meta_dir)
 
     if pending:
         n = min(jobs, len(pending))
@@ -316,7 +352,7 @@ def run_render(
             with mp.Pool(processes=n) as pool:
                 results = list(pool.imap_unordered(_render_job, pending))
 
-        root = paths.PROJECT_ROOT
+        root = data_dir   # 图片路径相对「所选 data 目录」，前端经 FS 句柄读取，任意路径可部署
         for di, vi, res in results:
             v = manifest["decks"][di]["versions"][vi]
             if res["ok"]:
@@ -339,10 +375,10 @@ def run_render(
                 v["error"] = res.get("error", "unknown")
                 v["pages"] = []
             finalize_deck_statuses(manifest)
-            _persist(manifest, active)
+            _persist(manifest, active, meta_dir)
 
     finalize_deck_statuses(manifest)
-    status = _persist(manifest, active)
+    status = _persist(manifest, active, meta_dir)
     return {"manifest": manifest, "status": status}
 
 
@@ -374,8 +410,14 @@ def _watch_loop(args: argparse.Namespace) -> int:
 
     print(f"[ingest] watch 模式启动（间隔 {args.interval}s，Ctrl+C 停止）")
     cfg_path = Path(args.config)
+    # 配置尚不存在（launch.py --config 可指向尚未创建的 data 目录/config）：等待其出现
+    if not cfg_path.is_file():
+        print(f"[ingest] 等待配置创建: {cfg_path}")
+        print("[ingest] 页面「数据」页勾选备选文件夹并「提交修改」后会自动生成并开始渲染")
+    while not cfg_path.is_file():
+        time.sleep(args.interval)
     cfg = load_config(cfg_path)
-    warn_missing_datasets(cfg)
+    warn_missing_datasets(cfg, cfg_path)
     last_fp = _config_fingerprint(cfg_path)
     while True:
         fp = _config_fingerprint(cfg_path)
@@ -383,18 +425,19 @@ def _watch_loop(args: argparse.Namespace) -> int:
             try:
                 cfg = _load_config_retry(cfg_path)
                 last_fp = fp
-                warn_missing_datasets(cfg)
+                warn_missing_datasets(cfg, cfg_path)
             except Exception as e:  # noqa: BLE001
                 # 配置正在被写入：本轮跳过并保留上次成功配置；不更新 last_fp，
                 # 下一轮会重试读取——绝不用半个配置跑渲染，也就不产生半成品产物。
                 print(f"[ingest] config.json 变化但读取失败，跳过本轮: {e}")
-        run_render(cfg, args.jobs, args.dpi, args.thumb_width, args.soffice, active=True)
+        run_render(cfg, cfg_path, args.jobs, args.dpi, args.thumb_width, args.soffice, active=True)
         time.sleep(args.interval)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="PPT 盲测对照：扫描/归组/渲染/建清单")
-    parser.add_argument("--config", default=str(paths.CONFIG_PATH), help="配置文件路径")
+    parser.add_argument("--config", default=str(paths.WATCH_CONFIG_PATH),
+                        help="配置文件路径（默认：工作区根目录 watched/config.json）")
     parser.add_argument("--jobs", type=int, default=os.cpu_count() or 1, help="渲染并行度")
     parser.add_argument("--dpi", type=int, default=150, help="渲染 DPI（默认 150）")
     parser.add_argument("--thumb-width", type=int, default=360, help="缩略图宽度（默认 360）")
@@ -406,14 +449,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.watch:
         return _watch_loop(args)
 
-    cfg = load_config(Path(args.config))
-    warn_missing_datasets(cfg)
-    result = run_render(cfg, args.jobs, args.dpi, args.thumb_width, args.soffice, active=False)
+    cfg_path = Path(args.config)
+    cfg = load_config(cfg_path)
+    warn_missing_datasets(cfg, cfg_path)
+    result = run_render(cfg, cfg_path, args.jobs, args.dpi, args.thumb_width, args.soffice, active=False)
     m, s = result["manifest"], result["status"]
     print(f"[ingest] 数据集: {len(m['datasets'])} 个")
     print(f"[ingest] Deck: 总 {s['total']} / 就绪 {s['ready']} / 渲染中 {s['rendering']} / 失败 {s['failed']}")
-    print(f"[ingest] manifest -> {paths.MANIFEST_PATH}")
-    print(f"[ingest] status   -> {paths.STATUS_PATH}")
+    _, meta_dir, _ = _dirs_from_config(cfg_path, cfg)
+    print(f"[ingest] manifest -> {meta_dir / 'manifest.json'}")
+    print(f"[ingest] status   -> {meta_dir / 'status.json'}")
     return 0
 
 

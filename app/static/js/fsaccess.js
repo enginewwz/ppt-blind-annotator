@@ -54,10 +54,19 @@ const FS = (() => {
     return typeof window.showDirectoryPicker === "function";
   }
 
+  /* 选择目录后立即请求读写权限：showDirectoryPicker 只给读权限，写文件（getFileHandle create）
+     需要 readwrite；在此处（用户手势内）授权后，后续写入不再依赖每次调用的用户激活。 */
+  async function grantWrite(h) {
+    try { await h.requestPermission({ mode: "readwrite" }); } catch (_) { /* 失败则写入时按需再请求 */ }
+    return h;
+  }
+
   async function requestAccess() {
-    dirHandle = await window.showDirectoryPicker();
-    await storeHandle(dirHandle);
-    return dirHandle;
+    const h = await window.showDirectoryPicker();
+    await grantWrite(h);
+    dirHandle = h;
+    await storeHandle(h);
+    return h;
   }
 
   /* 强制重新选择目录：弹出文件选择框；若用户取消则保留原目录（返回 null，不报错、不改界面） */
@@ -65,6 +74,7 @@ const FS = (() => {
     let h;
     try { h = await window.showDirectoryPicker(); }
     catch (_) { return null; }
+    await grantWrite(h);
     dirHandle = h;
     await storeHandle(h);
     return h;
@@ -77,6 +87,23 @@ const FS = (() => {
     try { h = await loadStoredHandle(); } catch (_) { /* ignore */ }
     if (h) dirHandle = h;
     return h;
+  }
+
+  /* 确保当前目录句柄具备读写权限（在用户手势内调用；已授权则立即返回 true）。
+     用于「提交修改」等会在中途弹 prompt 的操作：先在此处授权，避免 prompt 后 getFileHandle 因失去用户激活而失败。 */
+  async function ensureWritePermission() {
+    let h = dirHandle;
+    try { if (!h) h = await tryRestore(); } catch (_) { /* ignore */ }
+    if (!h) return false;
+    try {
+      const perm = await h.queryPermission({ mode: "readwrite" });
+      if (perm === "granted") return true;
+      if (perm === "prompt") {
+        const req = await h.requestPermission({ mode: "readwrite" });
+        return req === "granted";
+      }
+    } catch (_) { /* ignore */ }
+    return false;
   }
 
   /* 获取 data/ 目录句柄；prompt=false 时不弹窗（静默，用于后台轮询失败恢复） */
@@ -113,6 +140,25 @@ const FS = (() => {
 
   async function readJSON(name) {
     try { return JSON.parse(await readFileText(name)); } catch (_) { return null; }
+  }
+
+  /* 读取相对所选 data 目录的图片并返回 Blob URL。用目录句柄读，任意路径都可用，
+     不依赖页面位置或固定的 data/ 目录名。结果按路径缓存；文件重渲染后调用 clearUrlCache() 刷新。 */
+  const _urlCache = new Map();
+  async function fileUrl(relPath) {
+    if (_urlCache.has(relPath)) return _urlCache.get(relPath);
+    const parts = String(relPath).split("/").filter(Boolean);
+    let dh = dirHandle;
+    for (let i = 0; i < parts.length - 1; i++) dh = await dh.getDirectoryHandle(parts[i]);
+    const fh = await dh.getFileHandle(parts[parts.length - 1]);
+    const f = await fh.getFile();
+    const url = URL.createObjectURL(f);
+    _urlCache.set(relPath, url);
+    return url;
+  }
+  function clearUrlCache() {
+    _urlCache.forEach((u) => { try { URL.revokeObjectURL(u); } catch (_) { /* ignore */ } });
+    _urlCache.clear();
   }
 
   /* 原子写：优先 tmp+move（读者永远看到旧或新的完整文件）。
@@ -206,6 +252,45 @@ const FS = (() => {
     await dh.removeEntry(name, { recursive: true });
   }
 
+  /* ---- 本地配置桥接（launch.py 起的极简 HTTP 端点）----
+     前端无法直接写工作区文件（只拿到被打开目录的句柄），经 GET/PUT /config
+     把「外部目录 config」复制到工作区 data/config.json（ingest 始终监听它）。
+     未以 launch.py 启动（无 ?bridge= 参数）时全部返回空/失败，功能自动降级。 */
+  function bridgeBase() {
+    try {
+      // launch.py 经桥接同源伺服前端时：直接用当前 origin（无 CORS / 参数丢失问题）
+      if (location.protocol === "http:" || location.protocol === "https:") {
+        return location.origin;
+      }
+      // file:// 直开时：靠 launch.py 附加的 ?bridge= 端口定位
+      const p = new URLSearchParams(location.search).get("bridge");
+      return p ? `http://127.0.0.1:${p}` : null;
+    } catch (_) { return null; }
+  }
+
+  async function bridgeGetConfig() {
+    const base = bridgeBase();
+    if (!base) return null;
+    try {
+      const r = await fetch(base + "/config");
+      if (!r.ok) return null;
+      return await r.json();
+    } catch (_) { return null; }
+  }
+
+  async function bridgePutConfig(cfg) {
+    const base = bridgeBase();
+    if (!base) return false;
+    try {
+      const r = await fetch(base + "/config", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cfg),
+      });
+      return r.ok;
+    } catch (_) { return false; }
+  }
+
   /* 诊断信息：当前选中目录名 + 是否含关键文件 + 顶层条目列表。
      注：浏览器隐私限制，无法拿到绝对路径，只能拿到目录名（FileSystemHandle.name）。 */
   async function dirInfo() {
@@ -225,5 +310,5 @@ const FS = (() => {
     return info;
   }
 
-  return { hasSupport, getHandle, tryRestore, reSelect, readJSON, readFileText, writeJSONAtomic, appendLine, dirInfo, listDir, findSourceDirs, ensureDir, removeDir };
+  return { hasSupport, getHandle, tryRestore, reSelect, ensureWritePermission, readJSON, readFileText, fileUrl, clearUrlCache, writeJSONAtomic, appendLine, dirInfo, listDir, findSourceDirs, ensureDir, removeDir, bridgeBase, bridgeGetConfig, bridgePutConfig };
 })();

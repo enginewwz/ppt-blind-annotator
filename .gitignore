@@ -219,7 +219,9 @@ __marimo__/
 
 # ---- PPT 盲测对照标注平台 ----
 # 本地用户数据（渲染图片、标注、报告输出、测试脚本）不入库
+# watched/ 为工作区根目录的「跟踪配置」（ingest 始终监听；启动时重置为空）
 data/
+watched/
 reports/
 tests/
 

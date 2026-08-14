@@ -40,6 +40,45 @@ function absCommonPrefix(paths) {
   return "/" + p.join("/");
 }
 
+/* 由多个绝对路径推导数据根（data_dir）：归一化反斜杠，取公共目录前缀。
+   单条路径取父目录（避免根=数据集自身）。返回如 "C:/ext/data" 或 "/ext/data"。
+   注意：仅作「没有 data_dir 字段时」的最佳猜测；外部 config 自带 data_dir 时以其为准。 */
+function deriveDataRoot(paths) {
+  const norm = paths.map((p) => String(p).replace(/\\/g, "/"));
+  let parts = norm[0].split("/").filter(Boolean);
+  if (norm.length === 1) {
+    parts.pop();
+  } else {
+    for (let i = 1; i < norm.length; i++) {
+      const q = norm[i].split("/").filter(Boolean);
+      let j = 0;
+      while (j < parts.length && j < q.length && parts[j] === q[j]) j++;
+      parts = parts.slice(0, j);
+    }
+  }
+  return parts.join("/");
+}
+
+/* 去掉路径前缀中的数据根，得相对路径；不在根下则原样返回（可能仍是绝对路径） */
+function stripDataRoot(p, root) {
+  const s = String(p).replace(/\\/g, "/").replace(/\/+$/, "");
+  const r = String(root).replace(/\\/g, "/").replace(/\/+$/, "");
+  if (s === r) return "";
+  if (s.startsWith(r + "/")) return s.slice(r.length + 1);
+  return s;
+}
+
+/* 全树扫描「直接含 pptx 的目录」并缓存；「目录 ⟳ 刷新」会清缓存强制重扫，实现增量发现新文件夹。
+   重选 data 目录时也会清缓存。 */
+let _srcDirsCache = null;
+async function scanSourceDirs() {
+  if (_srcDirsCache) return _srcDirsCache;
+  let dirs = [];
+  try { dirs = await FS.findSourceDirs(4); } catch (_) { /* ignore */ }
+  _srcDirsCache = dirs.filter(Boolean);
+  return _srcDirsCache;
+}
+
 /* 在 data/ 目录树下按名称查找目录，返回相对路径（跳过 rendered/，限制深度） */
 async function findDirRel(targetName, maxDepth = 4) {
   const queue = [""];
@@ -72,14 +111,21 @@ const Datasets = {
   addSet: new Set(),    // 勾选要加入渲染的备选
   rmSet: new Set(),     // 勾选要取消渲染的现有组
 
+  /* 扫描备选文件夹：合并「现有数据源所在目录的兄弟文件夹」+「data 目录下任意位置直接含 pptx 的文件夹」。
+     二者合并后，无论新文件夹拖到 data 目录下的哪个位置都能被（增量）发现，
+     且不强制任何子目录名（如 demo/）。路径一律为「相对 data 目录」，跨环境可迁移。 */
   async loadSidebar() {
     let cfg = null;
     try { cfg = await FS.readJSON("config.json"); } catch (_) { /* ignore */ }
     this.cfg = cfg || { datasets: [] };
     this.rendered = (this.cfg.datasets || []).map((d) => d.name);
-    this.candidates = [];
     const cfgDs = this.cfg.datasets || [];
-    // 有数据源时：记录容器目录（相对+绝对，持久化），并从容器扫描候选
+    const seen = new Map();   // name → {name, rel} 去重池
+    const addCand = (name, rel) => {
+      if (!name || this.rendered.includes(name) || seen.has(name)) return;
+      seen.set(name, { name, rel });
+    };
+    // 1) 容器扫描：现有数据源所在目录的兄弟文件夹（新源通常放同层，如 demo/methodB）
     if (cfgDs.length) {
       try {
         const relFirst = await findDirRel(cfgDs[0].name);
@@ -97,32 +143,31 @@ const Datasets = {
             localStorage.setItem("ppt.containerAbs", this.containerAbs);
           } catch (_) { /* ignore */ }
           const entries = await FS.listDir(this.containerRel);
-          this.candidates = entries.filter((e) => e.kind === "directory").map((e) => ({
-            name: e.name,
-            rel: this.containerRel ? this.containerRel + "/" + e.name : e.name,
-          })).filter((c) => !this.rendered.includes(c.name));
+          for (const e of entries)
+            if (e.kind === "directory")
+              addCand(e.name, this.containerRel ? this.containerRel + "/" + e.name : e.name);
         }
       } catch (_) { /* ignore */ }
     }
-    // 容器扫描为空 / config 已无数据源（全部取消渲染）→ 全树扫描「直接含 pptx 的目录」作可加回的数据源
-    if (!this.candidates.length) {
-      let dirs = [];
-      try { dirs = await FS.findSourceDirs(4); } catch (_) { /* ignore */ }
-      this.candidates = dirs.filter(Boolean)
-        .map((rel) => ({ name: rel.split("/").pop(), rel }))
-        .filter((c) => !this.rendered.includes(c.name));
+    // 2) 全树扫描：data 目录下任意位置「直接含 pptx」的文件夹（外部拖入任意位置也能被发现）
+    for (const rel of await scanSourceDirs()) {
+      if (!rel) continue;
+      addCand(rel.split("/").pop(), rel);
+    }
+    // 无数据源（或容器为空）时恢复持久化的容器，供全取消后重加拼路径
+    if (!this.containerRel) {
       try {
         this.containerRel = localStorage.getItem("ppt.containerRel") || "";
         this.containerAbs = localStorage.getItem("ppt.containerAbs") || "";
       } catch (_) { /* ignore */ }
     }
+    this.candidates = [...seen.values()];
     this.candMap = {};
     this.candidates.forEach((c) => { this.candMap[c.name] = c; });
   },
 
   async renderSidebar() {
-    const el = document.getElementById("dataset-list");
-    await this.loadSidebar();
+    const el = document.getElementById("dataset-dir");
     const item = (group, nm, checked, extra) =>
       `<label class="ds-item ${extra}">
         <input type="checkbox" data-group="${group}" data-name="${escapeHtml(nm)}" ${checked ? "checked" : ""}>
@@ -150,12 +195,30 @@ const Datasets = {
   },
 
   async render() {
+    await this.loadSidebar();
     this.renderSidebar();
     this.syncControls();
     const ds = App.state.datasets || [];
     const decks = App.state.decks || [];
+    const hint = await this.backendHint();
     document.getElementById("ds-content").innerHTML =
-      this.axis === "dataset" ? this.datasetTable(ds, decks) : this.deckMatrix(ds, decks);
+      (hint ? `<div class="ds-hint">${hint}</div>` : "") +
+      (this.axis === "dataset" ? this.datasetTable(ds, decks) : this.deckMatrix(ds, decks));
+  },
+
+  /* 检测 ingest 是否在监听本目录：meta/status.json 缺失或 active 非 true →
+     提示「不会自动渲染」及启动命令（浏览器拿不到绝对路径，命令以模板展示）。 */
+  async backendHint() {
+    let st = null;
+    try { st = await FS.readJSON("meta/status.json"); } catch (_) { /* ignore */ }
+    if (!st) {
+      return "⚠️ 本目录还没有 meta/status.json —— 用 <code>python scripts/launch.py</code> 启动（本地桥接）后：" +
+        "在「数据」页勾选「备选文件夹」并「提交修改」，会嗅探建 config 并同步到工作区跟踪配置，ingest 自动开始渲染。";
+    }
+    if (st.active !== true) {
+      return "⚠️ ingest 未以 --watch 运行（仅一次性渲染过）—— 之后新增/修改不会自动增量渲染。请改用 <code>--watch</code> 启动。";
+    }
+    return "";
   },
 
   /* 纵轴=Deck：行=Deck，横轴=各数据源（method…），格内为对应版本状态 */
@@ -190,59 +253,134 @@ const Datasets = {
     return `<div class="ds-scroll"><div class="ds-table-wrap"><table class="ds-matrix"><thead><tr><th>数据源</th><th>Deck 数</th><th>就绪</th><th>渲染中</th><th>待处理</th><th>失败</th></tr></thead><tbody>${rows}</tbody></table></div></div>`;
   },
 
-  /* ---- 提交修改：一次性写 config.json（增/删渲染组），避免频繁写盘卡顿 ---- */
+  /* ---- 提交修改：一次性写 config.json（增/删渲染组），避免频繁写盘卡顿 ----
+     会同步到工作区跟踪配置（经桥接），使 ingest（始终监听工作区 config）也能渲染；
+     无 config.json 的外部目录：嗅探勾选后提交即自动建 config + 提示一次 data_dir 绝对路径。 */
   async commit() {
     if (!this.addSet.size && !this.rmSet.size) return;
     try {
+      // 提交前确保读写权限（在点击的用户手势内），避免中途 ensureDataDir 弹 prompt 后
+      // getFileHandle({create:true}) 因失去用户激活而失败（"User activation is required"）。
+      if (FS.ensureWritePermission) await FS.ensureWritePermission();
       const cfg = (await FS.readJSON("config.json")) || { datasets: [] };
       let ds = cfg.datasets || [];
       // 取消渲染：从配置移除（不删物理文件夹）
       if (this.rmSet.size) ds = ds.filter((d) => !this.rmSet.has(d.name));
-      // 加入渲染：把备选文件夹写进配置
+      // 加入渲染：把备选文件夹写进配置（路径写「相对 data 目录」）
       if (this.addSet.size) {
-        const allPaths = (cfg.datasets || []).map((d) => d.path).filter(Boolean);
-        let parentAbs = absCommonPrefix(allPaths);
-        if (allPaths.length === 1) {   // 单个数据源：公共前缀即它自身 → 容器取其父目录
-          const i = parentAbs.lastIndexOf("/");
-          parentAbs = i > 0 ? parentAbs.slice(0, i) : "";
-        }
         let maxOrder = Math.max(-1, ...ds.map((d) => d.sort_order ?? -1));
         const existing = new Set(ds.map((d) => d.name));
         for (const nm of this.addSet) {
           if (existing.has(nm)) continue;
-          ds.push({ name: nm, path: this.absPathFor(nm, parentAbs), sort_order: ++maxOrder });
+          ds.push({ name: nm, path: this.relPathFor(nm), sort_order: ++maxOrder });
           existing.add(nm);
         }
       }
       cfg.datasets = ds;
-      await FS.writeJSONAtomic("config.json", cfg);
+      // 无 data_dir（如 config 缺失的外部目录）：绝对路径自动推导，否则请用户填一次
+      const dd = await this.ensureDataDir(cfg);
+      if (!dd) { alert("已取消：未设置 data_dir，渲染无法定位外部目录。"); this.render(); return; }
+      await FS.writeJSONAtomic("config.json", cfg);   // 写回被打开目录（自描述，下次免填）
       this.addSet.clear();
       this.rmSet.clear();
-      await this.renderSidebar();
-      this.render();
-      // 提交后立即快速轮询：ingest 一重建 manifest，框数量/渲染状态就能尽快反映
+      await this.render();   // 重扫候选（已渲染的组不再出现在备选）+ 重绘
+      const okBridge = await FS.bridgePutConfig(cfg);  // 同步到工作区跟踪配置 → ingest 渲染
       App._pollDelay = 1000;
       App.poll();
-      alert("已提交修改并写入 config.json。\n（若 ingest 以 --watch 运行，会自动开始/停止对应组的渲染；否则请运行 python -m scripts.ingest --watch）");
+      alert(okBridge
+        ? "已提交：config 已写入本目录并同步到工作区跟踪配置，ingest 会自动开始渲染（输出到 data_dir）。"
+        : "已写入本目录 config.json，但未检测到本地桥接，无法触发 ingest 渲染。请用 python scripts/launch.py 启动。");
     } catch (e) { alert("提交失败：" + e.message); }
   },
 
-  /* 计算加入渲染的数据源绝对路径：
-     优先现有数据源容器公共前缀；否则用持久化的容器信息重建；最后退化为相对路径（ingest 以项目根解析）。 */
-  absPathFor(nm, parentAbs) {
-    if (parentAbs && parentAbs !== "/") return parentAbs + "/" + nm;
-    const c = this.candMap && this.candMap[nm];
-    if (this.containerAbs) {
-      let root = this.containerAbs;
-      const parts = (this.containerRel || "").split("/").filter(Boolean);
-      for (let k = 0; k < parts.length; k++) {   // 去掉容器分量 → data/ 根
-        const i = root.lastIndexOf("/");
-        if (i <= 0) { root = ""; break; }
-        root = root.slice(0, i);
-      }
-      if (root) return root + "/" + (c ? c.rel : nm);
+  /* 确保 config 有 data_dir：有则保留；数据集为绝对路径时自动推导公共前缀；
+     否则提示用户输入一次本 data 目录的绝对路径（浏览器隐私拿不到路径）。返回 data_dir 或 null。 */
+  async ensureDataDir(cfg) {
+    if (cfg.data_dir) return cfg.data_dir;
+    const ds = cfg.datasets || [];
+    const norm = ds.map((d) => d.path).filter((p) => p != null && p !== "");
+    const isAbs = (p) => /^([A-Za-z]:\/|\/)/.test(p);
+    if (norm.length && norm.length === ds.length && norm.every(isAbs)) {
+      const root = deriveDataRoot(norm);
+      if (root) { cfg.data_dir = root; return root; }
     }
-    return "data/" + (c ? c.rel : nm);   // 兜底：相对项目根
+    const p = prompt("该 data 目录没有 config.json / data_dir。\n请输入本目录的绝对路径（用于定位源文件与渲染输出）：", "");
+    if (!p) return null;
+    cfg.data_dir = p.trim().replace(/\\/g, "/").replace(/\/+$/, "");
+    return cfg.data_dir;
+  },
+
+  /* 加入渲染的数据源路径：写「相对 data 目录」的路径（跨环境可迁移），
+     ingest 以配置文件所在目录（即所选 data 目录）解析相对路径。 */
+  relPathFor(nm) {
+    const c = this.candMap && this.candMap[nm];
+    return (c && c.rel) || nm;
+  },
+
+  /* 增量扫描目录：外部拖入新文件夹后点「目录 ⟳ 刷新」；
+     清全树扫描缓存强制重扫，保留当前勾选（addSet/rmSet 不清）。 */
+  async refreshCandidates() {
+    _srcDirsCache = null;   // 强制增量重扫
+    await this.loadSidebar();
+    this.renderSidebar();
+    OpLog.add("增量扫描备选文件夹");
+  },
+
+  /* 把一份 config 复制到工作区 config（经本地桥接）；尽量推导 data_dir，使渲染输出落到外部目录。
+     返回是否成功。 */
+  async copyToWorkspace(localCfg) {
+    const cfg = JSON.parse(JSON.stringify(localCfg || {}));
+    const ds = cfg.datasets || [];
+    const paths = ds.map((d) => d.path).filter((p) => p != null && p !== "");
+    const isAbs = (p) => /^([A-Za-z]:\/|\/)/.test(p);
+    if (paths.length && paths.length === ds.length && paths.every(isAbs)) {
+      const root = deriveDataRoot(paths);
+      if (root) {
+        cfg.data_dir = root;
+        ds.forEach((d) => { const rp = stripDataRoot(d.path, root); if (rp) d.path = rp; });
+      }
+    }
+    const ok = await FS.bridgePutConfig(cfg);
+    if (ok) OpLog.add("复制 config → 工作区" + (cfg.data_dir ? "（data_dir 重定向）" : ""));
+    return ok;
+  },
+
+  /* 「⇥ 复制到工作区」：把当前打开的 data 目录的 config 复制到工作区 config（ingest 始终监听它） */
+  async importToWorkspace() {
+    const local = await FS.readJSON("config.json");
+    if (!local || !Array.isArray(local.datasets)) {
+      alert("当前 data 目录没有 config.json，无法复制。");
+      return;
+    }
+    const ds = local.datasets || [];
+    const relNoAnchor = !local.data_dir &&
+      ds.some((d) => d.path && !/^([A-Za-z]:[\\/]|\/)/.test(d.path));
+    const ok = await this.copyToWorkspace(local);
+    if (ok) {
+      let msg = "已把当前目录的 config 复制到工作区跟踪配置（ingest 监听它）。\n" +
+                "ingest 检测到变化后会自动开始渲染（输出到 data_dir 指向的目录）。";
+      if (relNoAnchor) {
+        msg += "\n\n⚠️ 提示：该 config 用相对路径且无 data_dir，ingest 会以工作区 watched/ 为基准解析，" +
+               "可能找不到源。建议在 config.json 里加一行 \"data_dir\": \"<该目录绝对路径>\"。";
+      }
+      alert(msg);
+      App._pollDelay = 1000;
+      App.poll();
+    } else {
+      alert("未检测到本地桥接（需用 python scripts/launch.py 启动，前端带 ?bridge=端口）。");
+    }
+  },
+
+  /* 「⇤ 写回目录」：把工作区 config 复制回当前打开的 data 目录的 config.json */
+  async exportToDir() {
+    const cfg = await FS.bridgeGetConfig();
+    if (!cfg) {
+      alert("未检测到本地桥接（需用 python scripts/launch.py 启动）。");
+      return;
+    }
+    await FS.writeJSONAtomic("config.json", cfg);
+    OpLog.add("工作区 config → 写回当前目录");
+    alert("已把工作区 config 写回当前 data 目录的 config.json。");
   },
 
   /* 同步控制条：纵轴下拉值 + 状态多选勾选/按钮文案 */
@@ -301,6 +439,9 @@ const Datasets = {
       }
     });
     document.getElementById("ds-refresh").addEventListener("click", () => this.refresh());
+    document.getElementById("ds-dir-refresh").addEventListener("click", () => this.refreshCandidates());
+    document.getElementById("ds-import").addEventListener("click", () => this.importToWorkspace());
+    document.getElementById("ds-export").addEventListener("click", () => this.exportToDir());
   },
 };
 
@@ -355,8 +496,10 @@ const App = {
     document.getElementById("btn-pick-dir").addEventListener("click", async () => {
       try {
         await FS.getHandle();
+        _srcDirsCache = null;   // 新目录 → 清扫描缓存
         this.hideOverlay();
         await this.loadAll();
+        this.autoImportIfNeeded();   // 工作区 config 为空时自动复制当前目录 config
         this.route();
         if (!this.state.currentDeckId) this.openFirstReady();
         this.poll();
@@ -367,6 +510,7 @@ const App = {
         if (Annotate && Annotate.flush) Annotate.flush();   // 先保存到旧目录
         const h = await FS.reSelect();
         if (!h) return;   // 取消：保留原目录与原界面（评分历史等），不弹错误
+        _srcDirsCache = null;   // 新目录 → 清扫描缓存
         // 选择不同目录 → 清理旧目录相关的本地选项/日志/标注
         try {
           localStorage.removeItem("ppt.prefs");
@@ -380,6 +524,7 @@ const App = {
         Annotate.close();
         document.getElementById("quick-open").value = "";
         await this.loadAll();
+        this.autoImportIfNeeded();   // 工作区 config 为空时自动复制当前目录 config
         this.setView("explorer");
         this.route();
         if (!this.state.currentDeckId) this.openFirstReady();
@@ -490,26 +635,37 @@ const App = {
     });
   },
 
-  /* index.html 位于 app/static/，manifest 内为项目根相对路径 */
-  imgSrc(rel) { return "../../" + rel; },
-
   async loadAll() {
     await this.refreshManifest();
     await this.refreshAnnotations();
   },
 
+  /* 打开/重选目录后：若本地桥接可用且工作区 config 为空，自动把当前目录 config 复制过去
+     （ingest 始终监听工作区 config） */
+  async autoImportIfNeeded() {
+    if (!FS.bridgeBase()) return;
+    try {
+      const wcfg = await FS.bridgeGetConfig();
+      if (wcfg && (wcfg.datasets || []).length) return;   // 工作区已有配置，不覆盖
+      const lcfg = await FS.readJSON("config.json");
+      if (lcfg && (lcfg.datasets || []).length) await Datasets.copyToWorkspace(lcfg);
+    } catch (_) { /* ignore */ }
+  },
+
   async refreshManifest() {
     const m = await FS.readJSON("meta/manifest.json");
+    this.state.dirInfo = await FS.dirInfo();
+    const di = this.state.dirInfo || {};
     if (!m) {
       this.state.datasets = [];
       this.state.decks = [];
-      document.getElementById("sb-annot").textContent =
-        "未找到 meta/manifest.json —— 请点右上角「data 目录」选择项目的 data/ 目录";
+      document.getElementById("sb-annot").textContent = di.hasConfig
+        ? "未找到 meta/manifest.json —— config 已存在；确认 ingest 在监听并稍候，或点数据页「⟳ 刷新」"
+        : "未找到 config.json/meta —— 打开任意含 pptx 的目录，在「数据」页会自动嗅探备选文件夹，勾选并「提交修改」即开始渲染";
     } else {
       this.state.datasets = m.datasets || [];
       this.state.decks = m.decks || [];
     }
-    this.state.dirInfo = await FS.dirInfo();
     this.updateFsStatus();
     Explorer.render();
   },
@@ -522,7 +678,7 @@ const App = {
     if (!d.name) { el.textContent = "未选择 data 目录"; el.title = ""; return; }
     el.textContent = d.hasMeta
       ? `目录: ${d.name} ✓ (含 meta/manifest.json)`
-      : `目录: ${d.name} ✗ 选错了，应选项目的 data/ 目录`;
+      : `目录: ${d.name} ✗ 未找到 meta/manifest.json`;
     el.title = "顶层条目: " + (d.top.length ? d.top.join(", ") : "（空目录）");
   },
 

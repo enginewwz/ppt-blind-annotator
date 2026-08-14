@@ -5,7 +5,12 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# 数据目录（浏览器与 CLI 共享）
+# 工作区根目录的「跟踪配置」目录——ingest 始终监听它（git 忽略）。
+# data/ 视为「外部数据目录」（含自己的 config.json / meta / rendered）。
+WATCH_DIR = PROJECT_ROOT / "watched"
+WATCH_CONFIG_PATH = WATCH_DIR / "config.json"
+
+# 数据目录（浏览器与 CLI 共享；data/ 模拟外部目录）
 DATA_DIR = PROJECT_ROOT / "data"
 META_DIR = DATA_DIR / "meta"
 RENDERED_DIR = DATA_DIR / "rendered"

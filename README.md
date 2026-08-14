@@ -81,18 +81,28 @@ ppt-blind-annotator/
    - 或生成演示数据：`python scripts/make_demo.py`
 
 3. **启动**
-   - 一键：`python scripts/launch.py`（后台跑 ingest --watch + 自动打开浏览器）
-   - 或手动：终端跑 `python -m scripts.ingest --config data/config.json --watch`，再用 Chrome / Edge 打开 `app/static/index.html`
+   - 一键：`python scripts/launch.py`
+     把工作区根目录的**跟踪配置** `watched/config.json` **重置为空**（`watched/` 已在 `.gitignore`）、
+     启动**本地配置桥接**（`127.0.0.1:8765`，**同源伺服前端**）+ `ingest --watch` 增量渲染 +
+     打开前端（`http://127.0.0.1:8765/`）。前台常驻，**Ctrl+C 一起停止**。
+   - 或手动：`python -m scripts.ingest --config watched/config.json --watch`，再打开 `http://127.0.0.1:8765/`（桥接在跑时）或 `app/static/index.html`（file://，无桥接功能）
 
-4. **授权**：页面首次打开时点右上角「data 目录」，选择项目的 `data/` 文件夹（之后自动记住）
+4. **授权 / 选择数据目录**：页面首次打开时点右上角「data 目录」（或底部目录 chip），选择某个 data 目录（工作区 `data/` 即模拟外部目录；也可选真外部目录）。打开后若跟踪配置为空会自动复制，或点**「⇥ 复制到工作区」**——把该目录的 config 复制到 `watched/config.json`，ingest 检测到变化即渲染（输出写回该目录）。
+
+> **工作区根目录 `watched/config.json` 是 ingest 始终监听的对象**（启动时被重置为空，防止残留污染新目录渲染）；
+> config 里的 `data_dir` 字段把渲染输出写回对应的外部目录（前端从绝对路径自动推导，或外部 config 自带），
+> 因此「写回渲染」落到该目录、前端直读。数据页 **「⇤ 写回目录」**把 `watched/config.json` 复制回当前目录。
+> 未用 `launch.py` 启动（无 `?bridge=`）时这两个按钮不可用，页面会提示。
+> 若未运行 `--watch`，页面顶部会显示提示，此时只能「加载 / 编辑」，不会生成 meta / 渲染。
 
 ## 常用命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `python scripts/launch.py` | 一键启动（ingest --watch 后台 + 打开前端） |
-| `python -m scripts.ingest --config data/config.json --watch` | 增量渲染，持续监视 |
-| `python -m scripts.ingest --config data/config.json` | 单次渲染后退出 |
+| `python scripts/launch.py` | 一键：重置 watched/config.json → 本地桥接 + ingest --watch + 开前端 |
+| `python -m scripts.bridge --port 8765` | 本地配置桥接（前端↔watched/config.json；一般由 launch.py 自动启动） |
+| `python -m scripts.ingest --config watched/config.json --watch` | 增量渲染，持续监视（默认即 watched） |
+| `python -m scripts.ingest --config <配置路径>` | 单次渲染后退出 |
 | `python scripts/make_demo.py` | 生成 4 组演示 pptx（methodA~D） |
 | `kill <ingest_pid>` | 停止 ingest --watch |
 
@@ -109,27 +119,30 @@ ppt-blind-annotator/
 
 ```jsonc
 // data/config.json —— 数据源列表（渲染组）+ 全局偏好
+// 视 data/ 为「外部目录」：data_dir 指向本目录（绝对路径），数据集 path 相对它
 {
+  "data_dir": "/abs/path/to/data",
   "datasets": [
-    { "name": "methodA", "path": "/abs/path/to/data/demo/methodA", "sort_order": 0 },
-    { "name": "methodB", "path": "/abs/path/to/data/demo/methodB", "sort_order": 1 }
+    { "name": "methodA", "path": "demo/methodA", "sort_order": 0 },
+    { "name": "methodB", "path": "demo/methodB", "sort_order": 1 }
   ],
   "prefs": { "shuffle": false, "sync_page": true }
 }
 ```
 
 ```
-data/
-├─ config.json                 # 上例（可由数据页「提交修改」自动写）
-├─ annotations.json            # 当前标注（前端写入）
-├─ annotations_history.jsonl   # 标注历史追加日志（前端写入）
-├─ demo/                       # 源 pptx（可放任意路径，仅需 config 指对）
+watched/                       # 工作区根目录「跟踪配置」——ingest 始终监听（git 忽略）
+└─ config.json                 # 由前端「⇥ 复制到工作区」写入；launch.py 启动时重置为空
+
+data/                          # 视为「外部数据目录」——前端打开它，渲染写回它
+├─ config.json                 # 上例（自描述：data_dir + 相对数据集路径）
+├─ annotations.json            # 当前标注（前端首次保存时自动创建）
+├─ annotations_history.jsonl   # 标注历史追加日志（前端首次重审时自动创建）
+├─ demo/                       # 源 pptx（路径相对 data_dir）
 │  ├─ methodA/slide_001.pptx
 │  ├─ methodA/slide_002.pptx
 │  └─ methodB/...
-├─ meta/                       # ingest 生成
-│  ├─ manifest.json
-│  └─ status.json
+├─ meta/                       # ingest 生成（manifest.json / status.json）
 └─ rendered/                   # ingest 生成：<数据源>/<Deck>/page_*.webp
 ```
 
