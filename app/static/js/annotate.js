@@ -11,6 +11,7 @@ const Annotate = (() => {
   const MIN_W = 260;       // 卡片最小宽度（保证评分/排名按钮不折叠）
   const MIN_H = 260;       // 卡片最小高度
   const HEADER_H = 136;    // 卡片头部近似高度（名字+页码+评分+排名）
+  const OVERLAP_AUTOARRANGE_THRESHOLD = 16;   // 供对比组数超过此值：关闭重叠退化为自动排列
   const FULL_RATIO = 0.5;  // 显示宽度/原图宽度 > 此值 → 用原图（另：超过缩略图原始大小也用原图）
 
   function shuffled(arr) {
@@ -299,11 +300,46 @@ const Annotate = (() => {
     applyBoxes();
   }
 
-  /* 保留大小，按左上角(y,x)排序后用 skyline 打包：优先上方、其次左方；
-     大框可占左侧，小框在右侧竖向堆叠（间距由占位宽度 w+GAP 保留） */
+  /* 关闭「允许重叠」用的排布核心：给定已占用框体 placed，为卡片 b 找「最上、最左」的
+     可放下位置（与已占用不重叠、不越出画布右边界）。网格搜索 O(n³)，但只用于「关闭允许
+     重叠」这一一次性动作，不用于热路径 arrange()。 */
+  function fitsAt(w, h, x, y, placed) {
+    // 右边界用「实际可视宽度」：boardCW() 含竖向滚动条，减去 SCROLLBAR 即内容右缘。
+    // 之前用 boardW()+PAD（= boardCW()-PAD-SCROLLBAR）多留了一个右 PAD 空档，
+    // 会把本可放下的卡片（如样本四紧挨样本三）误判为超宽而掉到下一行。
+    if (x + w > boardCW() - SCROLLBAR) return false;   // 不越出可视右边界（预留滚动条）
+    for (const p of placed) {
+      if (x < p.x + p.w && x + w > p.x && y < p.y + p.h && y + h > p.y) return false;
+    }
+    return true;
+  }
+  function placeNext(placed, b) {
+    // 候选 x/y：PAD + 每个已放框体的「左/上缘」与「右/下缘+GAP」，自上而下、自左而右找第一个可放点。
+    // 纳入左/上缘可让后一张卡「紧挨/对齐」前一张排（例如样本四紧挨样本三的同一行右侧）。
+    const xs = [PAD], ys = [PAD];
+    for (const p of placed) {
+      xs.push(p.x, p.x + p.w + GAP);
+      ys.push(p.y, p.y + p.h + GAP);
+    }
+    xs.sort((a, c) => a - c);
+    ys.sort((a, c) => a - c);
+    for (const y of ys) {
+      for (const x of xs) {
+        if (fitsAt(b.w, b.h, x, y, placed)) return { x, y };
+      }
+    }
+    const bottom = Math.max(PAD, ...placed.map((p) => p.y + p.h + GAP));
+    return { x: PAD, y: bottom };
+  }
+
+  /* 自动排列（高效 skyline，O(n²)）：保留大小，按左上角(y,x)顺序把每个框体在 skyline 上
+     找「最上、最左」的可放位置依次铺排（向上收紧、左靠填空）。
+     右边界用「实际可视宽度」boardCW()-SCROLLBAR（只预留滚动条，不再多留右 PAD）：
+     否则像样本四紧挨样本三这种「右缘恰好顶到边界」的情形会被误判放不下而掉到下一行。
+     注：placeNext 网格搜索是 O(n⁴)，不能用于此热路径（视口缩放/拖分隔条会反复调 arrange）。 */
   function arrange() {
     if (!st) return;
-    const right = boardW() + PAD;   // 内容右边界（绝对坐标）
+    const right = boardCW() - SCROLLBAR;   // 内容右边界（绝对坐标，预留滚动条）
     st._lastW = boardW();
     const idxs = st.boxes.map((_, i) => i).sort((a, b) => {
       const A = st.boxes[a], B = st.boxes[b];
@@ -392,6 +428,38 @@ const Annotate = (() => {
       });
       st.boxes.forEach(clampBox);
     }
+  }
+
+  /* 关闭「允许重叠」：分两步——① 先按左上(y,x)优先序贪心选出「互不重叠的保留子集」：
+     与已保留者不重叠即留在原位；② 只把其余（补集）经 placeNext 重排到「最上、最左」的
+     不重叠位置。相比旧单遍做法（移动后的新位置会连锁挤动后面本不碍事的框），本版先定保留
+     子集、只动补集：保留尽量多的框原位不动，移动更少、更可预期。
+     兜底：供对比组数超过 OVERLAP_AUTOARRANGE_THRESHOLD 时，placeNext 网格搜索（最坏
+     O(n⁴)）会明显变慢，此时直接退化为「自动排列」（skyline O(n²)），保证不卡顿。 */
+  function resolveOverlapPreserve() {
+    if (!st) return;
+    if (st.boxes.length > OVERLAP_AUTOARRANGE_THRESHOLD) { arrange(); return; }
+    const order = st.boxes.map((_, i) => i).sort((a, b) => {
+      const A = st.boxes[a], B = st.boxes[b];
+      return (A.y - B.y) || (A.x - B.x) || (a - b);
+    });
+    // ① 选保留子集（原位不动）；与已保留者重叠的进补集
+    const kept = [];      // 保留框体（对象引用）
+    const toMove = [];    // 待移动下标
+    for (const idx of order) {
+      const b = st.boxes[idx];
+      if (kept.some((p) => overlapBoxes(b, p))) toMove.push(idx);
+      else kept.push(b);
+    }
+    // ② 只把补集经 placeNext 重排；已排好的补集也计入占用，保证互不重叠
+    const placed = kept.slice();
+    for (const idx of toMove) {
+      const b = st.boxes[idx];
+      const spot = placeNext(placed, b);
+      b.x = spot.x; b.y = spot.y;
+      placed.push(b);
+    }
+    applyBoxes();
   }
 
   /* 视口变化（侧栏拖宽/窗口缩放）：按列模式→重新按列填满；自由模式→按宽度等比拉伸/压缩，
@@ -898,7 +966,7 @@ const Annotate = (() => {
       App.state.prefs.overlap = st.overlap;
       App.savePrefs();
       syncToggle("overlap", st.overlap);
-      if (!st.overlap) arrange();   // 关闭允许重叠 → 默认自动排一遍
+      if (!st.overlap) resolveOverlapPreserve();   // 关闭允许重叠 → 先选不重叠保留子集、只移动重叠补集
     });
     // 自动排列：单击=排一遍/取消；双击=开启连续自动排列（开启时强制关闭允许重叠）
     let autoClickTimer = null;
