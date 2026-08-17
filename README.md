@@ -24,6 +24,14 @@ flowchart LR
         UI[标注界面 / 数据页]
         FS[File System Access API]
     end
+    subgraph 工作区[工作区根目录]
+        WCFG[watched/config.json]
+    end
+    subgraph scripts[scripts/ Python 工具]
+        BR[bridge.py 本地桥接 127.0.0.1:8765]
+        ING[ingest.py --watch 增量渲染]
+        REN[render.py soffice→pdf→WebP]
+    end
     subgraph data[本地数据目录]
         CFG[config.json]
         ANNO[annotations.json]
@@ -32,17 +40,16 @@ flowchart LR
         META[meta/manifest.json, status.json]
         RND[rendered/ 图片]
     end
-    subgraph 后端[scripts/ Python 工具]
-        ING[ingest.py --watch 增量渲染]
-        REN[render.py soffice→pdf→WebP]
-    end
-    UI --> FS
+    UI -->|FS Access| FS
     FS --> CFG
     FS --> ANNO
     FS --> HIST
     FS --> CTL
     FS --> META
     FS --> RND
+    UI -->|配置复制/写回| BR
+    BR --> WCFG
+    ING -->|监听| WCFG
     ING --> REN
     ING --> META
     ING --> RND
@@ -50,8 +57,8 @@ flowchart LR
 ```
 
 - 前端：`app/static/`，无构建步骤，直接打开 `index.html`
-- 后端：`scripts/`，仅做渲染 / 建清单，不提供 HTTP
-- 运行产物与本地配置（`reports/`、`docs/.build/` 等）已 git 忽略，不入库
+- 后端：`scripts/`，负责渲染 / 建清单 / 报告与本地配置桥接；桥接仅监听 `127.0.0.1`，不对外提供服务
+- 运行产物与本地配置不入库
 
 ## 目录结构
 
@@ -70,11 +77,12 @@ ppt-blind-annotator/
 │  ├─ ingest.py               # 扫描/归组/渲染/建清单，--watch 增量
 │  ├─ render.py               # soffice→pdf→PyMuPDF→WebP（staging 提交）
 │  ├─ report.py               # 聚合标注 → reports/report.{json,csv,html}
-│  ├─ launch.py               # 一键启动：ingest --watch + 打开浏览器
+│  ├─ bridge.py               # 本地配置桥接（127.0.0.1，前端↔watched/config.json）
+│  ├─ launch.py               # 一键启动：本地桥接 + ingest --watch + 打开浏览器
 │  ├─ atomic.py               # 原子写（os.replace）
 │  ├─ paths.py / constants.py
 ├─ requirements.txt
-└─ README.md                  # 本文档（人类可读总文档）
+└─ README.md
 ```
 
 ## 快速开始
@@ -123,7 +131,7 @@ ppt-blind-annotator/
 
 ## 数据目录构造示例
 
-> 运行产物不入库；此处给出**构造方式示例**，便于新环境重建。
+> 此处给出**构造方式示例**，便于新环境重建。
 
 ```jsonc
 // config.json —— 数据源列表（渲染组）+ 全局偏好
