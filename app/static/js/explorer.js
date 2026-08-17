@@ -1,4 +1,4 @@
-/* Deck 列表（侧边栏）。M4：虚拟滚动——只渲染可见窗口（±OVERSCAN），数百~上千 Deck 也流畅。 */
+/* Deck 列表（侧边栏）。虚拟滚动——只渲染可见窗口（±OVERSCAN），数百~上千 Deck 也流畅。 */
 const Explorer = (() => {
   let filter = "";
   let statusFilter = "all";   // all | pending | done

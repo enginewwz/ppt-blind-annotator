@@ -1,4 +1,4 @@
-/* 报告视图（M3）：在浏览器内基于 manifest + 标注实时聚合展示（与 scripts/report.py 同口径）。
+/* 报告视图：在浏览器内基于 manifest + 标注实时聚合展示（与 scripts/report.py 同口径）。
    完整离线 HTML/CSV/JSON 由 `python scripts/report.py` 生成到 reports/（HTML 内联柱状图 + 回链）。 */
 const Report = {
   /* 一组分数的统计：count / mean / median / variance / stddev / distribution{1..5}（与 report.py 一致） */

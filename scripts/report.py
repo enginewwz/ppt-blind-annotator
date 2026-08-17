@@ -1,4 +1,4 @@
-"""M3 报告生成：读 manifest + annotations → 聚合每数据集 / 每 Deck 统计 →
+"""报告生成：读 manifest + annotations → 聚合每数据集 / 每 Deck 统计 →
 输出 reports/report.{json,csv,html}（HTML 内联 CSS 柱状图 + 回链 `index.html#/deck/<id>`）。
 
 用法：

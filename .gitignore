@@ -225,5 +225,8 @@ watched/
 reports/
 tests/
 
-# 本地浏览器启动参数（launch.py 读取；云端仓库不应含 wayland 等本地参数）
+# 本地浏览器启动参数（launch.py 读取）
 scripts/local_browser.py
+
+# 本地测试脚本不入库
+scripts/make_demo.py

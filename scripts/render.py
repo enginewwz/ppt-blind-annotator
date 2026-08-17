@@ -1,4 +1,4 @@
-"""M1 渲染管线：pptx ->(soffice headless)-> pdf ->(PyMuPDF)-> 每页像素 ->(Pillow)-> WebP 全图 + 缩略图。
+"""渲染管线：pptx ->(soffice headless)-> pdf ->(PyMuPDF)-> 每页像素 ->(Pillow)-> WebP 全图 + 缩略图。
 
 注意：soffice 的 `--convert-to png` 对 pptx 只导出第一页，必须走 pdf 中间产物。
 """

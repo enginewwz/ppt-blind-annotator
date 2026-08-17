@@ -105,7 +105,7 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
   border: 1px solid var(--border-panel);
   margin: 2px 6px 4px 0; overflow: hidden;   /* 顶部上移，缩小与搜索栏间距 */
 }
-#view { flex: 1; overflow: auto; }
+#view { flex: 1; overflow: auto; min-height: 0; }   /* min-height:0 让子级能收缩、内部滚动（否则会撑高主页面） */
 
 /* deck list rows */
 .deck-row {
@@ -186,7 +186,7 @@ code { background: var(--bg-hover); border-radius: var(--radius-sm); padding: 1p
 #layout-seg button + button { border-left: 1px solid var(--border-panel); }   /* 竖线分隔（更深、清晰） */
 #layout-seg button.on { background: var(--accent); color: var(--fg-on-accent); }   /* 选中：主题色底白字 */
 
-#columns { flex: 1; position: relative; overflow: auto; }
+#columns { flex: 1; position: relative; overflow: auto; min-height: 0; }   /* 标注卡片流的滚动容器（矮 Deck 无竖向滚动条） */
 /* 到底后继续下翻的底部小字提示（判完后跳下一 Deck 用） */
 #next-hint {
   position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%);

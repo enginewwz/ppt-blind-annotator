@@ -6,7 +6,9 @@
 
 用法：
     python scripts/launch.py
-        # 启动时把 watched/config.json 重置为空（防止上次会话残留污染新目录渲染）
+        # 默认做「路径匹配」检查：上次的 watched/config.json 仍指向已存在的数据集目录
+        # （是之前的数据集）→ 保留不清空，ingest 断点续跑；路径失效 / 换新目录 → 重置为空。
+        # 需强制清空时加 --reset-config。
         # → 启动本地 HTTP 桥接（127.0.0.1:8765，本进程内线程）+ ingest --watch + 打开前端。
         # 本命令会一直运行：按 Ctrl+C 停止（ingest 与桥接一起退出），无需单独 kill 子进程。
         # 前端打开某个 data 目录（如 data/）后，「⇥ 复制到工作区」（或自动）把其 config
@@ -21,6 +23,7 @@ git 忽略文件 `scripts/local_browser.py`（CHROME_EXTRA 列表）或环境变
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -62,6 +65,41 @@ def _browser_cmd(index_uri: str) -> list[str] | None:
     return None
 
 
+def _config_points_to_existing_data(config_path: Path) -> bool:
+    """断点续跑判定：跟踪配置是否仍指向「已存在的数据集目录」（路径匹配）。
+
+    - data_dir 或任一数据集路径（相对路径以 data_dir / config 所在目录为根，与 ingest 的
+      `_resolve_ds_path` 一致）目录存在 → 是之前的数据集 → 保留续跑（不清空）；
+    - 缺失 / 损坏 / 空数据集 / 所有路径都不存在（过期或换新目录）→ False → 重置为空，
+      防止旧会话残留污染新目录渲染。
+    """
+    try:
+        cfg = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return False
+    if not isinstance(cfg, dict):
+        return False
+    datasets = cfg.get("datasets") or []
+    if not datasets:
+        return False
+    raw_dir = cfg.get("data_dir")
+    base = Path(str(raw_dir)) if raw_dir else config_path.parent
+    if not base.is_absolute():
+        base = config_path.parent / base
+    # data_dir 本身存在（上次的输出/meta 还在）→ 是之前的数据集
+    if base.is_dir():
+        return True
+    for ds in datasets:
+        if not isinstance(ds, dict):
+            continue
+        p = Path(str(ds.get("path", "")))
+        if not p.is_absolute():
+            p = base / p
+        if p.is_dir():
+            return True
+    return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="一键启动：后台 ingest + 本地桥接 + 打开前端")
     parser.add_argument("--config", default=None, help="配置文件路径（默认：工作区根目录 watched/config.json）")
@@ -70,6 +108,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--batch", type=int, default=0, help="watch 每批最多渲染的版本数（0=默认 8）")
     parser.add_argument("--bridge-port", type=int, default=8765, help="本地配置桥接端口（0=关闭）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
+    parser.add_argument("--reset-config", action="store_true",
+                        help="启动时把跟踪配置重置为空（默认保留上次配置以便断点续跑）")
     args = parser.parse_args(argv)
 
     # 本地配置桥接：前端经 HTTP 把外部目录 config 复制到工作区 config（ingest 始终监听它）。
@@ -87,13 +127,18 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = Path(args.config) if args.config else paths.WATCH_CONFIG_PATH
     # 默认（未显式 --config）：使用工作区根目录的「跟踪配置」watched/config.json。
-    # 启动时总是重置为空 —— 防止上次会话残留污染新目录的渲染；前端打开某个 data 目录后
-    # 会自动（或点「⇥ 复制到工作区」）把其 config 复制进来。
+    # 断点续跑：先做「路径匹配」检查——配置仍指向已存在的数据集目录（是之前的数据集）
+    # 才保留不清空（ingest 从中断处续跑）；路径已失效 / 换新目录 / 空配置 → 重置为空，
+    # 防旧会话残留污染新目录渲染。显式 --reset-config 强制清空。
+    # 前端打开某个 data 目录后会自动（或点「⇥ 复制到工作区」）把其 config 复制进来。
     if not args.config:
         try:
             cfg.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_json(cfg, {"datasets": [], "prefs": {"shuffle": False, "sync_page": True}})
-            print(f"[launch] 已重置跟踪配置: {cfg}（watched/ 已在 .gitignore，不入库）")
+            if cfg.is_file() and not args.reset_config and _config_points_to_existing_data(cfg):
+                print(f"[launch] 保留跟踪配置（路径匹配，断点续跑）: {cfg}")
+            else:
+                atomic_write_json(cfg, {"datasets": [], "prefs": {"shuffle": False, "sync_page": True}})
+                print(f"[launch] 已重置跟踪配置: {cfg}（watched/ 已在 .gitignore，不入库）")
         except Exception as e:  # noqa: BLE001
             print(f"[launch] 重置跟踪配置失败: {e}")
     cmd = [sys.executable, "-m", "scripts.ingest",

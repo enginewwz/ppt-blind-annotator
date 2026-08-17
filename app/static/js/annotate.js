@@ -100,6 +100,7 @@ const Annotate = (() => {
 
   function setPage(delta, col) {
     if (!st) return;
+    if (st.nextDist) { st.nextDist = 0; showBottomHint(null); }   // 换页即重新开始累计（别沿用上次判断）
     if (st.sync) {
       const maxP = totalPages();               // 最长的 PPT 页数（同步以它为准）
       const cur = st.page[0] || 0;
@@ -141,11 +142,17 @@ const Annotate = (() => {
     return (st.page[i] || 0) >= max;
   }
 
-  /* 卡片流是否已滚到底部（接近底边，阈值 24px） */
+  /* 某滚动容器是否已到底：内容未超高（无需竖向滚动条，如四列排列的矮 Deck）→ 直接视为到底；
+     有滚动条 → 接近底边（阈值 24px）才算到底。 #columns 与 #view 都判——别搞错滑条。 */
+  function atScrollBottom(el) {
+    if (!el) return true;
+    const over = el.scrollHeight - el.clientHeight;
+    if (over <= 8) return true;   // 无竖向滚动条：内容已全部可见 → 到底
+    return el.scrollTop + el.clientHeight >= el.scrollHeight - 24;
+  }
   function boardAtBottom() {
-    const c = document.getElementById("columns");
-    if (!c) return true;
-    return c.scrollTop + c.clientHeight >= c.scrollHeight - 24;
+    return atScrollBottom(document.getElementById("columns")) &&
+           atScrollBottom(document.getElementById("view"));
   }
 
   /* 本组是否判完：已提交，或最好/最差都已选且所有数据源都有评分 */
@@ -157,25 +164,49 @@ const Annotate = (() => {
       st.scores && Object.keys(st.scores).length >= n;
   }
 
-  /* 底部小字提示（到底后继续下翻时显示；msg=null 隐藏） */
+  /* 底部小字提示：显示后 3 秒自动消失；再次滚动到底会重新显示 3 秒；msg=null 立即隐藏。
+     未判完提示停留 3 秒消失，之后再次向下滚动再显示 3 秒。 */
+  let hintTimer = null;
   function showBottomHint(msg) {
     const el = document.getElementById("next-hint");
-    if (!el) return;
-    if (msg) { el.textContent = msg; el.hidden = false; }
-    else { el.hidden = true; }
+    if (hintTimer) { clearTimeout(hintTimer); hintTimer = null; }
+    if (!msg) { if (el) el.hidden = true; return; }
+    if (el) { el.textContent = msg; el.hidden = false; }
+    hintTimer = setTimeout(() => { if (el) el.hidden = true; }, 3000);
   }
 
-  function onWheel(e, col) {
+  /* 判完跳下一组：先把当前草稿落盘（继承「自动存草稿」逻辑——与 setView("report") 一致：
+     await flush() 完成后再切到下一 Deck，避免把未保存草稿丢在旧 Deck），再跳转。
+     flush() 内部已捕获写盘失败（置 dirty 重试），此处兜底：保存失败也不困住用户。 */
+  let advancing = false;
+  function advanceToNextDeck() {
+    if (advancing) return;   // 防止 flush 异步期间重复触发跳转
+    advancing = true;
+    Promise.resolve(dirty ? flush() : undefined)
+      .then(() => { advancing = false; App.stepDeck(1); })
+      .catch(() => { advancing = false; App.stepDeck(1); });
+  }
+
+  /* 滚轮翻页：监听整个大框 #columns（不只看卡片内）——在任意位置下滚到末页 + 卡片流滚到底
+     都能进入下一组。同步模式整组联动；独立模式只翻光标所在列（滚到卡片外/缝隙处回退第 0 列）。
+     250ms 节流只作用于翻页（防触控板惯性连翻），跳下一组的累计不节流。 */
+  function onColumnsWheel(e) {
     if (!st) return;
     if (spaceDown) return;   // 空格+滚轮：交给原生滚动（不翻页）
-    e.preventDefault();
-    const i = Number(col.dataset.idx);
-    const now = performance.now();
-    if (now - (st.lastWheel[i] || 0) < 250) return;
-    st.lastWheel[i] = now;
+    // 找到光标所在列（供独立翻页用）；滚到卡片外/缝隙处时回退到第 0 列（仅用于跳转判定）
+    const col = e.target && e.target.closest ? e.target.closest(".col") : null;
+    const i = col ? Number(col.dataset.idx) : 0;
     const down = e.deltaY > 0;
-    if (down && atLastPage(i) && boardAtBottom()) {
-      if (!deckJudged()) {
+    const judged = deckJudged();
+    // 跳下一组就绪条件（不节流——要灵敏累计滚轮距离）：
+    //   · 已判完 + 空白处：直接可跳（不必翻到末页/滚到底——该组已标注完，无需逐页重看）
+    //   · 卡片上 / 未判完：需「末页 + 滚到底」才可跳（卡片上滚轮仍用于翻页查看）
+    const jumpReady = judged
+      ? (!col || (atLastPage(i) && boardAtBottom()))
+      : (atLastPage(i) && boardAtBottom());
+    if (down && jumpReady) {
+      e.preventDefault();
+      if (!judged) {
         // 本组未判完：提示先判完，不累计、不跳转
         showBottomHint("本组尚未判完（选最好/最差并打分）后才能进入下一个");
         return;
@@ -185,10 +216,17 @@ const Annotate = (() => {
       if (st.nextDist >= NEXT_DECK_JUMP_DIST) {
         st.nextDist = 0;
         showBottomHint(null);
-        App.stepDeck(1);
+        advanceToNextDeck();   // 先自动存草稿，完成后切到下一 Deck
       }
       return;
     }
+    // 翻页只在光标落在卡片上时发生；空白处不翻页（交给原生滚动，有滚动条就滚动画布）
+    if (!col) return;
+    e.preventDefault();
+    // 翻页逻辑：250ms 节流（防触控板惯性连翻）
+    const now = performance.now();
+    if (now - (st.lastWheel[i] || 0) < 250) return;
+    st.lastWheel[i] = now;
     if (st.nextDist) { st.nextDist = 0; showBottomHint(null); }   // 上翻/不在底部 → 复位提示
     setPage(down ? 1 : -1, i);
   }
@@ -296,7 +334,6 @@ const Annotate = (() => {
       img.addEventListener("load", () => refreshSrc(img));   // 缩略图加载后按原始大小重新判断
       body.appendChild(ph);
       body.appendChild(img);
-      body.addEventListener("wheel", (e) => onWheel(e, col), { passive: false });
 
       col.appendChild(head);
       col.appendChild(body);
@@ -989,6 +1026,11 @@ const Annotate = (() => {
         });
       if (needClear) clearImageCache();   // 取最新渲染的图片
       st.deck = deck;
+      // 就绪了 → 清掉左下角「渲染中… / 缓存已清理，正在优先重渲…」提示（避免渲染好仍一直挂着）
+      if (deck.status === "ready" && !wasReady) {
+        const sb = document.getElementById("sb-annot");
+        if (sb) sb.textContent = "";
+      }
       if (deck.versions.length !== prevCount) {
         // 数据源数量变化：重建卡片（保留列数偏好，重新按列排；已评分数/排名保留）
         st.baseOrder = deck.versions.map((_, i) => i);
@@ -1017,6 +1059,8 @@ const Annotate = (() => {
 
   function bind() {
     document.getElementById("columns").addEventListener("click", onColClick);
+    // 滚轮翻页/跳下一组：绑定在整个大框上（任意位置下滚都响应，不只看卡片内）
+    document.getElementById("columns").addEventListener("wheel", onColumnsWheel, { passive: false });
     // 单击空白处取消选中
     document.getElementById("board").addEventListener("click", (e) => {
       if (e.target === e.currentTarget) selectCard(null);
@@ -1101,6 +1145,8 @@ const Annotate = (() => {
         st.colMode = true;
         App.state.prefs.cols = st.cols;
         App.savePrefs();
+        st.effCols = 0;   // 显式选列：绕过迟滞，直接按所选列数排（仍受 fit 视口宽度约束）——
+                          // 否则「两列切四列」会先变三列，再点一下才到四列
         autoArrange();
         syncLayoutSeg();
       }));

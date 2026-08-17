@@ -895,13 +895,19 @@ const App = {
     } catch (_) { /* ignore */ }
   },
 
-  /* 记录当前查看的 Deck（data/current.json）——缓存清理「休息」保护据此判断（轮到你时先不清） */
-  async markCurrentDeck(deckId) {
-    try {
-      if (FS.ensureWritePermission) await FS.ensureWritePermission();
-      await FS.writeJSONAtomic("current.json",
-        { deck_id: Number(deckId), updated_at: new Date().toISOString() });
-    } catch (_) { /* 尽力而为 */ }
+  /* 记录当前查看的 Deck（data/current.json）——缓存清理「休息」保护据此判断（轮到你时先不清）。
+     串行化写入（promise 链）：快速连续开多个 Deck 时保证「最后打开者最后写完」，
+     避免异步写乱序导致 current.json 指向旧 Deck、误清正在看的 Deck。 */
+  markCurrentDeck(deckId) {
+    this._currentChain = (this._currentChain || Promise.resolve())
+      .then(() => this._writeCurrentDeck(Number(deckId)))
+      .catch(() => {});
+    return this._currentChain;
+  },
+  async _writeCurrentDeck(deckId) {
+    if (FS.ensureWritePermission) await FS.ensureWritePermission();
+    await FS.writeJSONAtomic("current.json",
+      { deck_id: deckId, updated_at: new Date().toISOString() });
   },
 
   stepDeck(delta) {
