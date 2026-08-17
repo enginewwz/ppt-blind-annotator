@@ -52,9 +52,11 @@ const Annotate = (() => {
       auto: !!App.state.prefs.auto,
       boxes: keepLayout ? prevLayout.boxes.map((b) => (b ? { ...b } : null)) : versions.map(() => null),
       selected: null,
+      nextDist: 0,          // 到底后继续下翻的累计距离（判完后跳下一 Deck 用）
       _lastW: keepLayout ? prevLayout._lastW : 0,
       effCols: 0,
     };
+    showBottomHint(null);   // 新开 Deck：隐藏底部提示
     // 切换到「不同」的 Deck 时乱序；重选当前 Deck / 搜索 Enter 不重新乱序
     if (!sameDeck && !noShuffle && App.state.prefs.shuffle) {
       st.order = shuffled(st.baseOrder);
@@ -83,6 +85,7 @@ const Annotate = (() => {
     flush();   // 切换/关闭前保存当前草稿（只在有改动时落盘）
     if (timer) clearTimeout(timer);
     st = null;
+    showBottomHint(null);   // 关闭/切换：隐藏底部提示
     const b = document.getElementById("board");
     if (b) b.innerHTML = "";
     // 清空工具栏残留：Deck 名、保存提示（切换 Deck 时 openDeck 会随后重新设置）；
@@ -124,7 +127,44 @@ const Annotate = (() => {
     c.scrollBy({ top: dir * vh * 0.85, behavior: "smooth" });
   }
 
-  /* 滚轮翻页：同步模式整组联动，独立模式只翻当前列；250ms 节流防止触控板惯性连翻 */
+  /* 滚轮翻页：同步模式整组联动，独立模式只翻当前列；250ms 节流防止触控板惯性连翻。
+     已翻到最后一页且卡片流滚到底后，继续下翻：本组已判完（选最好/最差 + 全打分，或已提交）→
+     显示底部提示并累计距离 → 跳下一 Deck；未判完则提示先判完，不跳转。 */
+  const NEXT_DECK_JUMP_DIST = 480;   // 到底后再下翻累计滚轮距离达到此值 → 跳下一 Deck
+
+  /* 当前列是否已翻到最后一页 */
+  function atLastPage(i) {
+    if (!st) return true;
+    if (st.sync) return (st.page[0] || 0) >= totalPages() - 1;
+    const v = versionAt(i);
+    const max = v && v.pages && v.pages.length ? v.pages.length - 1 : 0;
+    return (st.page[i] || 0) >= max;
+  }
+
+  /* 卡片流是否已滚到底部（接近底边，阈值 24px） */
+  function boardAtBottom() {
+    const c = document.getElementById("columns");
+    if (!c) return true;
+    return c.scrollTop + c.clientHeight >= c.scrollHeight - 24;
+  }
+
+  /* 本组是否判完：已提交，或最好/最差都已选且所有数据源都有评分 */
+  function deckJudged() {
+    if (!st) return false;
+    if (st.status === "submitted") return true;
+    const n = st.deck.versions.length;
+    return st.best != null && st.worst != null &&
+      st.scores && Object.keys(st.scores).length >= n;
+  }
+
+  /* 底部小字提示（到底后继续下翻时显示；msg=null 隐藏） */
+  function showBottomHint(msg) {
+    const el = document.getElementById("next-hint");
+    if (!el) return;
+    if (msg) { el.textContent = msg; el.hidden = false; }
+    else { el.hidden = true; }
+  }
+
   function onWheel(e, col) {
     if (!st) return;
     if (spaceDown) return;   // 空格+滚轮：交给原生滚动（不翻页）
@@ -133,7 +173,24 @@ const Annotate = (() => {
     const now = performance.now();
     if (now - (st.lastWheel[i] || 0) < 250) return;
     st.lastWheel[i] = now;
-    setPage(e.deltaY > 0 ? 1 : -1, i);
+    const down = e.deltaY > 0;
+    if (down && atLastPage(i) && boardAtBottom()) {
+      if (!deckJudged()) {
+        // 本组未判完：提示先判完，不累计、不跳转
+        showBottomHint("本组尚未判完（选最好/最差并打分）后才能进入下一个");
+        return;
+      }
+      st.nextDist = (st.nextDist || 0) + Math.abs(e.deltaY || 100);
+      showBottomHint("已到底部 · 继续滚动进入下一个 Deck…");
+      if (st.nextDist >= NEXT_DECK_JUMP_DIST) {
+        st.nextDist = 0;
+        showBottomHint(null);
+        App.stepDeck(1);
+      }
+      return;
+    }
+    if (st.nextDist) { st.nextDist = 0; showBottomHint(null); }   // 上翻/不在底部 → 复位提示
+    setPage(down ? 1 : -1, i);
   }
 
   function renderPageNav() {
@@ -227,12 +284,17 @@ const Annotate = (() => {
       const body = document.createElement("div");
       body.className = "col-body";
       body.title = "滚轮翻页" + (st.sync ? "（同步）" : "（本列独立）");
+      // 未就绪时显示占位（渲染中/待处理/失败等），就绪后隐藏、改显图片
+      const ph = document.createElement("div");
+      ph.className = "col-placeholder muted";
+      ph.textContent = "渲染中…";
       const img = document.createElement("img");
       img.className = "slide";
       img.loading = "lazy";
       img.decoding = "async";
       img.alt = `样本 ${i + 1}`;
       img.addEventListener("load", () => refreshSrc(img));   // 缩略图加载后按原始大小重新判断
+      body.appendChild(ph);
       body.appendChild(img);
       body.addEventListener("wheel", (e) => onWheel(e, col), { passive: false });
 
@@ -712,10 +774,21 @@ const Annotate = (() => {
       }
       if (!v || v.status !== "ready" || !v.pages || !v.pages.length) {
         img.style.display = "none";
+        const ph = col.querySelector(".col-placeholder");
+        if (ph) {
+          ph.style.display = "";
+          ph.textContent = !v ? "无版本"
+            : v.status === "failed" ? "渲染失败"
+            : v.evicted ? "缓存已清理"
+            : v.status === "rendering" ? "渲染中…"
+            : "待处理…";
+        }
         return;
       }
       const pg = v.pages[Math.min(curPage(i), v.pages.length - 1)];
       img.style.display = "";
+      const ph = col.querySelector(".col-placeholder");
+      if (ph) ph.style.display = "none";
       img.dataset.thumbPath = pg.thumb;   // manifest 内相对所选 data 目录的路径
       img.dataset.fullPath = pg.src;
       img.dataset.pgW = String(pg.w || 0);
@@ -743,6 +816,14 @@ const Annotate = (() => {
       try {
         const url = await FS.fileUrl(path);   // 经所选目录句柄读图 → Blob URL（任意路径可用）
         if (img.dataset.currentPath !== path) return;   // 期间已切到别的页/图
+        // 先解码再换 src：避免大图（原始图）加载/解码期间旧图被清空 → 翻页闪动
+        await new Promise((resolve) => {
+          const probe = new Image();
+          probe.onload = () => resolve();
+          probe.onerror = () => resolve();
+          probe.src = url;
+        });
+        if (img.dataset.currentPath !== path) return;
         img.src = url;
       } catch (_) { /* 图片缺失：保持空白 */ }
     }
@@ -864,18 +945,18 @@ const Annotate = (() => {
     if (submit) App.stepDeck(1);
   }
 
-  /* 切换/关闭前落盘当前草稿：仅在有实际改动时写（翻页/移动/缩放不置脏，不落盘） */
+  /* 切换/关闭前落盘当前草稿：仅在有实际改动时写（翻页/移动/缩放不置脏，不落盘）。
+     返回 Promise，供 setView 等在渲染报告前等待落盘完成（避免把未保存草稿误计为已标注）。 */
   function flush() {
-    if (!st) return;
-    if (!dirty) return;                  // 无实际改动（仅翻页/移动/缩放）→ 不落盘
+    if (!st || !dirty) return Promise.resolve();
     const id = st.deck.id;
     const status = st.status === "submitted" ? "submitted" : "draft";
     const next = snapshot(status);
     const prev = App.state.savedAnnotations[id] || null;
-    if (sameAnno(prev, next)) { dirty = false; return; }   // 内容未变（仅时间戳）→ 不写
+    if (sameAnno(prev, next)) { dirty = false; return Promise.resolve(); }   // 内容未变（仅时间戳）→ 不写
     dirty = false;
     document.getElementById("annot-saved").textContent = "保存中…";
-    App.saveAnnotation(id, next).then(() => {
+    return App.saveAnnotation(id, next).then(() => {
       if (st && st.deck.id === id) document.getElementById("annot-saved").textContent = "已保存 ✓";
     }).catch(() => {
       dirty = true;
@@ -897,9 +978,16 @@ const Annotate = (() => {
 
   function refreshStatus(deck) {
     if (st && st.deck.id === deck.id) {
-      clearImageCache();   // 状态刷新：取最新渲染的图片
       const prevCount = st.deck.versions.length;
       const wasReady = st.deck.status === "ready";
+      // 只有「版本数变化 / 某版本变为 ready / 源变化（重渲）」才清缓存取最新图；
+      // 否则（就绪且未变）不清——避免轮询时反复撤销 Blob URL + 清 currentPath，导致原图无故闪动。
+      const needClear = deck.versions.length !== prevCount ||
+        deck.versions.some((n) => {
+          const o = st.deck.versions.find((x) => x.dataset_id === n.dataset_id);
+          return !o || o.src_key !== n.src_key || (o.status !== "ready" && n.status === "ready");
+        });
+      if (needClear) clearImageCache();   // 取最新渲染的图片
       st.deck = deck;
       if (deck.versions.length !== prevCount) {
         // 数据源数量变化：重建卡片（保留列数偏好，重新按列排；已评分数/排名保留）
@@ -912,9 +1000,9 @@ const Annotate = (() => {
         renderColumns(false);
         updateImages();
         renderPageNav();
-      } else if (!(wasReady && deck.status === "ready")) {
-        // 状态变化（pending/rendering → ready）才刷新图片与状态文字；
-        // 已就绪且数量未变 → 画布已是最终态，停止刷新（目录棕点仍由 Explorer 持续更新）
+      } else if (needClear || !(wasReady && deck.status === "ready")) {
+        // 状态变化（pending/rendering → ready）或重渲才刷新图片与状态文字；
+        // 已就绪且未变 → 画布已是最终态，不清缓存不刷新（目录棕点仍由 Explorer 持续更新）
         updateImages();
         renderPageNav();
       }

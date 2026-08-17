@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", default=None, help="配置文件路径（默认：工作区根目录 watched/config.json）")
     parser.add_argument("--jobs", type=int, default=0, help="渲染并行度（默认 CPU 核数）")
     parser.add_argument("--dpi", type=int, default=150, help="渲染 DPI")
+    parser.add_argument("--batch", type=int, default=0, help="watch 每批最多渲染的版本数（0=默认 8）")
     parser.add_argument("--bridge-port", type=int, default=8765, help="本地配置桥接端口（0=关闭）")
     parser.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     args = parser.parse_args(argv)
@@ -101,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
         cmd += ["--jobs", str(args.jobs)]
     if args.dpi:
         cmd += ["--dpi", str(args.dpi)]
+    if args.batch:
+        cmd += ["--batch", str(args.batch)]
     proc = subprocess.Popen(
         cmd, cwd=paths.PROJECT_ROOT,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,

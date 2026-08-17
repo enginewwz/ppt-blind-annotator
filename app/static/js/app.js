@@ -110,6 +110,7 @@ const Datasets = {
   containerAbs: "",     // 数据源容器绝对路径（持久化）
   addSet: new Set(),    // 勾选要加入渲染的备选
   rmSet: new Set(),     // 勾选要取消渲染的现有组
+  prefs: { cache_limit: "", batch: 0 },   // 渲染设置（缓存上限 / 每批数量，写进 config prefs）
 
   /* 扫描备选文件夹：合并「现有数据源所在目录的兄弟文件夹」+「data 目录下任意位置直接含 pptx 的文件夹」。
      二者合并后，无论新文件夹拖到 data 目录下的哪个位置都能被（增量）发现，
@@ -117,8 +118,9 @@ const Datasets = {
   async loadSidebar() {
     let cfg = null;
     try { cfg = await FS.readJSON("config.json"); } catch (_) { /* ignore */ }
-    this.cfg = cfg || { datasets: [] };
+    this.cfg = cfg || { datasets: [], prefs: {} };
     this.rendered = (this.cfg.datasets || []).map((d) => d.name);
+    this.prefs = Object.assign({ cache_limit: "", batch: 0 }, this.cfg.prefs || {});
     const cfgDs = this.cfg.datasets || [];
     const seen = new Map();   // name → {name, rel} 去重池
     const addCand = (name, rel) => {
@@ -168,6 +170,7 @@ const Datasets = {
 
   async renderSidebar() {
     const el = document.getElementById("dataset-dir");
+    const settingsEl = document.getElementById("ds-settings");
     const item = (group, nm, checked, extra) =>
       `<label class="ds-item ${extra}">
         <input type="checkbox" data-group="${group}" data-name="${escapeHtml(nm)}" ${checked ? "checked" : ""}>
@@ -180,6 +183,25 @@ const Datasets = {
       item("add", c.name, this.addSet.has(c.name), this.addSet.has(c.name) ? "add" : "")).join("") ||
       '<div class="empty muted">（无备选文件夹）</div>';
     const dirty = this.addSet.size + this.rmSet.size > 0;
+    const opt = (cur, list) => list.map(([v, label]) =>
+      `<option value="${v}" ${String(cur) === String(v) ? "selected" : ""}>${label}</option>`).join("");
+    // CLI --batch 已指定（status.batch_cli）→ 每批下拉禁用并提示
+    const batchLocked = !!(App.state.status && App.state.status.batch_cli);
+    const settings =
+      `<div class="ds-settings">
+        <label class="ds-ctl" title="rendered/ 渲染产物总量上限：超出后自动清理最旧的 Deck（需重看时点它即优先重渲）">缓存限制
+          <span class="sel-wrap">
+            <select id="ds-cache-limit">${opt(this.prefs.cache_limit, [["", "无限制"], ["100M", "100M"], ["300M", "300M"], ["500M", "500M"], ["1G", "1G"]])}</select>
+          </span>
+        </label>
+        <label class="ds-ctl" title="ingest --watch 每轮最多渲染的版本数（越小插队越及时；自动=8）">每批数量
+          <span class="sel-wrap">
+            <select id="ds-batch" ${batchLocked ? "disabled" : ""}>${opt(this.prefs.batch, [["0", "自动 (8)"], ["4", "4"], ["8", "8"], ["16", "16"], ["32", "32"], ["64", "64"]])}</select>
+          </span>
+          ${batchLocked ? '<span class="ds-lock muted" title="CLI --batch 已指定，此处不可改">CLI 锁定</span>' : ""}
+        </label>
+      </div>`;
+    if (settingsEl) settingsEl.innerHTML = settings;
     el.innerHTML =
       `<div class="ds-sel-tip muted">正在渲染（勾选以取消渲染）</div>${renderedHtml}` +
       `<div class="ds-sel-tip muted">备选文件夹（勾选以加入渲染）</div>${candHtml}` +
@@ -192,6 +214,16 @@ const Datasets = {
         this.renderSidebar();
       }));
     document.getElementById("ds-commit").addEventListener("click", () => this.commit());
+    const cl = document.getElementById("ds-cache-limit");
+    if (cl) cl.addEventListener("change", (e) => {
+      this.prefs.cache_limit = e.target.value;
+      this.savePrefs();
+    });
+    const bt = document.getElementById("ds-batch");
+    if (bt) bt.addEventListener("change", (e) => {
+      this.prefs.batch = Number(e.target.value) || 0;
+      this.savePrefs();
+    });
   },
 
   async render() {
@@ -207,16 +239,23 @@ const Datasets = {
   },
 
   /* 检测 ingest 是否在监听本目录：meta/status.json 缺失或 active 非 true →
-     提示「不会自动渲染」及启动命令（浏览器拿不到绝对路径，命令以模板展示）。 */
+     提示「不会自动渲染」及启动命令（浏览器拿不到绝对路径，命令以模板展示）。
+     active 可能因「上次单次渲染残留 / 工作区 config 未同步」为 false，用桥接区分。 */
   async backendHint() {
     let st = null;
     try { st = await FS.readJSON("meta/status.json"); } catch (_) { /* ignore */ }
+    const bridge = FS.bridgeBase() && (await FS.bridgeGetConfig());
     if (!st) {
       return "⚠️ 本目录还没有 meta/status.json —— 用 <code>python scripts/launch.py</code> 启动（本地桥接）后：" +
         "在「数据」页勾选「备选文件夹」并「提交修改」，会嗅探建 config 并同步到工作区跟踪配置，ingest 自动开始渲染。";
     }
     if (st.active !== true) {
-      return "⚠️ ingest 未以 --watch 运行（仅一次性渲染过）—— 之后新增/修改不会自动增量渲染。请改用 <code>--watch</code> 启动。";
+      if (bridge) {
+        return "⚠️ status.active 仍为 false：ingest 已以 --watch 运行，但尚未处理本目录（工作区 config 未同步？）。" +
+          "请点「⇥ 复制到工作区」同步后再试；若仍不变，确认最近一次 ingest 用的是 --watch 而非单次渲染。";
+      }
+      return "⚠️ 未检测到本地桥接（launch.py）—— 需用 <code>python scripts/launch.py</code> 以 --watch 启动，" +
+        "新增 / 修改才会自动增量渲染。";
     }
     return "";
   },
@@ -277,6 +316,7 @@ const Datasets = {
         }
       }
       cfg.datasets = ds;
+      cfg.prefs = Object.assign({}, cfg.prefs || {}, this.prefs);   // 保留渲染设置
       // 无 data_dir（如 config 缺失的外部目录）：绝对路径自动推导，否则请用户填一次
       const dd = await this.ensureDataDir(cfg);
       if (!dd) { alert("已取消：未设置 data_dir，渲染无法定位外部目录。"); this.render(); return; }
@@ -291,6 +331,19 @@ const Datasets = {
         ? "已提交：config 已写入本目录并同步到工作区跟踪配置，ingest 会自动开始渲染（输出到 data_dir）。"
         : "已写入本目录 config.json，但未检测到本地桥接，无法触发 ingest 渲染。请用 python scripts/launch.py 启动。");
     } catch (e) { alert("提交失败：" + e.message); }
+  },
+
+  /* 保存渲染设置（缓存上限 / 每批数量）到 config prefs，并同步到工作区跟踪配置 */
+  async savePrefs() {
+    try {
+      if (FS.ensureWritePermission) await FS.ensureWritePermission();
+      const cfg = (await FS.readJSON("config.json")) || { datasets: [], prefs: {} };
+      cfg.prefs = Object.assign({}, cfg.prefs || {}, this.prefs);
+      this.cfg = cfg;
+      await FS.writeJSONAtomic("config.json", cfg);
+      const okBridge = await FS.bridgePutConfig(cfg);
+      OpLog.add("保存渲染设置（缓存/每批）" + (okBridge ? "" : "（未同步到工作区）"));
+    } catch (e) { alert("保存设置失败：" + e.message); }
   },
 
   /* 确保 config 有 data_dir：有则保留；数据集为绝对路径时自动推导公共前缀；
@@ -553,6 +606,16 @@ const App = {
     });
     Annotate.bind();
     Datasets.bind();
+    // 报告顶部工具栏（静态按钮，只绑定一次；report.js 每次切页都会重绘正文，不能在 render 里重复绑定，
+    // 否则监听器累积 → 点一次「导出 HTML」会下载多份）。
+    const repRefresh = document.getElementById("rep-refresh");
+    if (repRefresh) repRefresh.addEventListener("click", async () => {
+      await this.refreshManifest();
+      await this.refreshAnnotations();
+      Report.render();
+    });
+    const repExport = document.getElementById("rep-export");
+    if (repExport) repExport.addEventListener("click", () => Report.exportHTML());
     this.bindSplitter();
 
     // 清空菜单：清空当前 Deck 或全部 Deck 的标注与历史
@@ -698,6 +761,7 @@ const App = {
         await this.refreshManifest();
         await this.refreshAnnotations();
         this.syncOpenDeck();
+        if (this.state.view === "datasets") Datasets.render();   // 数据页实时刷新后端提示 / 每批锁定
       }
     }
     this.updateStatusBar();
@@ -717,13 +781,21 @@ const App = {
       view === "datasets" ? "数据集" : view === "explorer" ? "Deck 列表" : "报告";
     document.getElementById("deck-list").hidden = view !== "explorer";
     document.getElementById("deck-filter-row").hidden = view !== "explorer";
+    document.getElementById("sidebar-count").hidden = view !== "explorer";   // 计数只在标注页显示
     document.getElementById("dataset-list").hidden = view !== "datasets";
+    // 报告视图：隐藏左侧整个灰色目录栏（含分隔条），报告区全宽
+    document.getElementById("sidebar").hidden = view === "report";
+    document.getElementById("splitter").hidden = view === "report";
     document.getElementById("annotate").hidden = view !== "explorer";
     document.getElementById("datasets").hidden = view !== "datasets";
     document.getElementById("report").hidden = view !== "report";
     document.getElementById("empty-state").hidden = true;
     if (view === "datasets") Datasets.render();
-    if (view === "report") Report.render();
+    if (view === "report") {
+      // 先落盘当前草稿（异步）再渲染报告：避免把「仅内存、未保存」的草稿误计为已标注
+      const flushP = (Annotate && Annotate.flush) ? Annotate.flush() : Promise.resolve();
+      Promise.resolve(flushP).then(() => Report.render());
+    }
     if (view === "explorer") {
       document.getElementById("empty-state").hidden =
         this.state.decks.some((d) => d.status === "ready");
@@ -775,18 +847,61 @@ const App = {
   openDeck(id, opts) {
     const deck = this.deckById(id);
     if (!deck) return;
-    const allowPending = !!(opts && opts.allowPending);
-    if (!allowPending && deck.status !== "ready") {
-      document.getElementById("sb-annot").textContent = deck.name + " 尚未就绪（渲染中）";
-      return;
+    const evicted = deck.evicted === true ||
+      (!!deck.versions && deck.versions.length > 0 && deck.versions.every((v) => v.evicted));
+    if (deck.status !== "ready") {
+      // 未就绪：照样选中并打开（先显示占位框），请求插队渲染；就绪后轮询自动填图
+      document.getElementById("sb-annot").textContent =
+        deck.name + (evicted ? " 缓存已清理，正在优先重渲…" : " 渲染中…就绪后自动显示图片");
+      this.requestPriority(deck.id);
+    } else {
+      this.clearPriority(id);   // 已就绪打开 → 从优先级移除
     }
     this.state.currentDeckId = id;
     location.hash = "#/deck/" + id;
+    this.markCurrentDeck(id);   // 记录当前查看 Deck（缓存清理保护：轮到它时先休息）
     this.setView("explorer");
     document.getElementById("empty-state").hidden = true;
     Annotate.openDeck(deck, opts);
     Explorer.render();   // 刷新列表高亮与完成标记（✓/●）
     OpLog.add("打开 Deck " + deck.name);
+  },
+
+  /* ---------- 插队渲染：请求 / 清除某 Deck 的优先渲染（写 data/priority.json） ----------
+     用户跳过一些 Deck 到某 Deck 处等待时，ingest --watch 每批都会读这个文件，
+     把对应 Deck 排到最前渲染。写失败只是尽力而为，不影响正常使用。 */
+  async requestPriority(deckId) {
+    try {
+      if (FS.ensureWritePermission) await FS.ensureWritePermission();
+      const cur = (await FS.readJSON("priority.json")) || {};
+      const ids = new Set(Array.isArray(cur.deck_ids) ? cur.deck_ids.map(Number) : []);
+      if (ids.has(Number(deckId))) return;   // 已在队列，不重复写盘
+      ids.add(Number(deckId));
+      await FS.writeJSONAtomic("priority.json",
+        { deck_ids: [...ids], updated_at: new Date().toISOString() });
+      OpLog.add("请求优先渲染 Deck " + deckId);
+    } catch (_) { /* ignore */ }
+  },
+
+  /* 该 Deck 已就绪并打开后，从优先级中移除（避免 stale 条目堆积；无变化不写盘） */
+  async clearPriority(deckId) {
+    try {
+      const cur = (await FS.readJSON("priority.json")) || {};
+      const had = Array.isArray(cur.deck_ids) ? cur.deck_ids : [];
+      const ids = had.filter((i) => Number(i) !== Number(deckId));
+      if (ids.length === had.length) return;
+      await FS.writeJSONAtomic("priority.json",
+        { deck_ids: ids, updated_at: new Date().toISOString() });
+    } catch (_) { /* ignore */ }
+  },
+
+  /* 记录当前查看的 Deck（data/current.json）——缓存清理「休息」保护据此判断（轮到你时先不清） */
+  async markCurrentDeck(deckId) {
+    try {
+      if (FS.ensureWritePermission) await FS.ensureWritePermission();
+      await FS.writeJSONAtomic("current.json",
+        { deck_id: Number(deckId), updated_at: new Date().toISOString() });
+    } catch (_) { /* 尽力而为 */ }
   },
 
   stepDeck(delta) {

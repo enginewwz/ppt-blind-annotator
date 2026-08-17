@@ -205,6 +205,13 @@ def build_or_merge_manifest(cfg: dict, config_path: Path, manifest_path: Path,
                 v["page_count"] = oldv.get("page_count", 0)
                 v["pages"] = oldv.get("pages", [])
                 v["src_key"] = oldv.get("src_key")
+            elif oldv and oldv.get("src_key") == key and oldv.get("evicted"):
+                # 已被缓存清理（源未变）：保持 pending + evicted，不自动重渲
+                v["status"] = STATUS_PENDING
+                v["evicted"] = True
+                v["src_key"] = oldv.get("src_key")
+                v["page_count"] = 0
+                v["pages"] = []
             else:
                 v["status"] = STATUS_PENDING
                 v["src_key"] = key
@@ -215,7 +222,7 @@ def build_or_merge_manifest(cfg: dict, config_path: Path, manifest_path: Path,
 
 
 def finalize_deck_statuses(manifest: dict) -> None:
-    """按版本状态汇总 Deck 状态与 page_count（就地修改）。"""
+    """按版本状态汇总 Deck 状态与 page_count，并重算 evicted 标记（就地修改）。"""
     for deck in manifest["decks"]:
         st = [v.get("status", STATUS_PENDING) for v in deck["versions"]]
         if all(s == STATUS_READY for s in st):
@@ -229,11 +236,15 @@ def finalize_deck_statuses(manifest: dict) -> None:
         deck["page_count"] = max(
             (v.get("page_count", 0) for v in deck["versions"]), default=0
         )
+        vs = deck.get("versions", []) or []
+        deck["evicted"] = bool(vs) and all(bool(v.get("evicted")) for v in vs)
 
 
-def build_status_from_manifest(manifest: dict, active: bool) -> dict:
+def build_status_from_manifest(manifest: dict, active: bool,
+                               batch: int | None = None,
+                               batch_cli: bool = False) -> dict:
     decks = manifest["decks"]
-    return {
+    status = {
         "version": manifest.get("version", 1),
         "updated_at": now_iso(),
         "total": len(decks),
@@ -242,6 +253,11 @@ def build_status_from_manifest(manifest: dict, active: bool) -> dict:
         "failed": sum(1 for d in decks if d["status"] == STATUS_FAILED),
         "active": active,
     }
+    if batch is not None:
+        # 每批数量（前端据此显示；batch_cli=True 表示由 CLI --batch 指定 → 前端下拉禁用）
+        status["batch"] = int(batch)
+        status["batch_cli"] = bool(batch_cli)
+    return status
 
 
 def warn_missing_datasets(cfg: dict, config_path: Path, data_dir: Path | None = None) -> None:
@@ -253,12 +269,13 @@ def warn_missing_datasets(cfg: dict, config_path: Path, data_dir: Path | None = 
             print(f"[ingest] 警告: 数据集 '{ds['name']}' 路径不存在: {ds['path']}")
 
 
-def _persist(manifest: dict, active: bool, meta_dir: Path) -> dict:
+def _persist(manifest: dict, active: bool, meta_dir: Path,
+             batch: int | None = None, batch_cli: bool = False) -> dict:
     """原子写 manifest + status（version 自增），返回 status。"""
     meta_dir.mkdir(parents=True, exist_ok=True)
     manifest["version"] = int(manifest.get("version", 0)) + 1
     atomic_write_json(meta_dir / "manifest.json", manifest)
-    status = build_status_from_manifest(manifest, active)
+    status = build_status_from_manifest(manifest, active, batch, batch_cli)
     atomic_write_json(meta_dir / "status.json", status)
     return status
 
@@ -299,6 +316,244 @@ def _cleanup_orphan_renders(manifest: dict, rendered_dir: Path) -> None:
                 pass
 
 
+# ---------------- 插队渲染（优先级 + 分批） + 缓存总量管理 ----------------
+
+
+PRIORITY_FOLLOW_DEFAULT = 3   # 插队时连同优先级 Deck 后多少个 Deck 一起提到最前
+
+
+def parse_cache_limit(value) -> int | None:
+    """解析缓存上限：'100M'/'300M'/'500M'/'1G'/'' → 字节数或 None（无限制）。
+
+    'K'/'M'/'G' 后缀（大小写不敏感），纯数字视为字节；无法解析 / 非正数 → None（安全默认=无限制）。"""
+    if value is None:
+        return None
+    s = str(value).strip().upper()
+    if not s or s in ("0", "NONE", "UNLIMITED", "无限"):
+        return None
+    mult = 1
+    if s.endswith("G"):
+        mult = 1024 ** 3
+        s = s[:-1]
+    elif s.endswith("M"):
+        mult = 1024 ** 2
+        s = s[:-1]
+    elif s.endswith("K"):
+        mult = 1024
+        s = s[:-1]
+    try:
+        n = float(s)
+    except ValueError:
+        return None
+    if n <= 0:
+        return None
+    return int(n * mult)
+
+
+def _dir_size(path: Path) -> int:
+    """目录下所有文件字节数（递归）。"""
+    if not path.is_dir():
+        return 0
+    return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+
+
+def load_current_deck(data_dir: Path) -> int | None:
+    """读取前端记录的当前查看 Deck（data_dir/current.json），供缓存清理保护；缺失 / 损坏返回 None。"""
+    path = data_dir / "current.json"
+    if not path.is_file():
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return int(data.get("deck_id"))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _enforce_cache_limit(manifest: dict, rendered_dir: Path,
+                         limit_bytes: int | None,
+                         current_id: int | None = None) -> bool:
+    """缓存总量管理：rendered/ 超过 limit_bytes 时，按「最久未写入」（mtime 最小）顺序清理
+    已就绪 Deck 的渲染产物（删目录 + 版本标记 evicted → 不再自动重渲，仅被优先级请求时重渲）。
+
+    - 保护：若清理顺位轮到「当前查看 Deck」（data_dir/current.json，前端每次打开 Deck 时写入），
+      则先休息（不清它），待用户看过后（current.json 变化）再恢复正常清理；之后 watch 继续渲染
+      后续 Deck，生成下一组缓存。
+    - 返回是否发生了清理（调用方需要据此落盘）。limit_bytes=None 表示无限制。"""
+    if limit_bytes is None:
+        return False
+    if not rendered_dir.is_dir():
+        return False
+    total = _dir_size(rendered_dir)
+    if total <= limit_bytes:
+        return False
+    current_idx: int | None = None
+    if current_id is not None:
+        id_to_idx = {deck["id"]: i for i, deck in enumerate(manifest["decks"])}
+        current_idx = id_to_idx.get(current_id)
+    ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
+    candidates: list[tuple[float, int, dict, list[Path]]] = []
+    for di, deck in enumerate(manifest["decks"]):
+        vs = deck.get("versions", []) or []
+        if not vs or not all(v.get("status") == STATUS_READY for v in vs):
+            continue
+        dirs = [rendered_dir / ds_name.get(v["dataset_id"], "") / deck["name"]
+                for v in vs]
+        dirs = [d for d in dirs if d.is_dir()]
+        if not dirs:
+            continue
+        try:
+            mt = max((p.stat().st_mtime for d in dirs for p in d.rglob("*") if p.is_file()),
+                     default=0.0)
+        except OSError:
+            mt = 0.0
+        candidates.append((mt, di, deck, dirs))
+    candidates.sort(key=lambda c: c[0])   # 旧的先清（mtime 升序）
+    changed = False
+    for _, di, deck, dirs in candidates:
+        if total <= limit_bytes:
+            break
+        if di == current_idx:
+            # 清理顺位轮到当前查看的 Deck：先休息（不清它），等看完再正常清理
+            break
+        size = sum(_dir_size(d) for d in dirs)
+        for d in dirs:
+            shutil.rmtree(d, ignore_errors=True)
+        total -= size
+        for v in deck["versions"]:
+            v["status"] = STATUS_PENDING
+            v["evicted"] = True
+            v["page_count"] = 0
+            v["pages"] = []
+            v.pop("error", None)
+        changed = True
+    if changed:
+        finalize_deck_statuses(manifest)   # 重算 deck 状态与 evicted 标记
+    return changed
+
+
+def load_priority(data_dir: Path) -> list[int]:
+    """读取前端写入的优先级请求（data_dir/priority.json），返回优先渲染的 deck_id 列表（保持顺序）。
+
+    文件形如 {"deck_ids": [5, 9], "updated_at": "..."}；缺失 / 损坏时返回空列表（尽力而为）。
+    前端经 FS Access 原子写（tmp+move），读端不会看到半成品。"""
+    path = data_dir / "priority.json"
+    if not path.is_file():
+        return []
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        raw = data.get("deck_ids") if isinstance(data, dict) else None
+        return [int(i) for i in raw] if raw else []
+    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        return []
+
+
+def _priority_front_deck_indices(manifest: dict, priority_ids: list[int],
+                                 follow: int) -> list[int]:
+    """应排最前的 deck 下标（按 manifest 顺序）：每个优先级 deck 连同其后 follow 个 deck。"""
+    id_to_idx = {deck["id"]: i for i, deck in enumerate(manifest["decks"])}
+    out: list[int] = []
+    seen: set[int] = set()
+    n = len(manifest["decks"])
+    for pid in priority_ids or []:
+        i = id_to_idx.get(pid)
+        if i is None:
+            continue
+        for j in range(i, min(i + follow + 1, n)):
+            if j not in seen:
+                seen.add(j)
+                out.append(j)
+    return out
+
+
+def order_pending_by_priority(pending: list[tuple], manifest: dict,
+                              priority_ids: list[int] | None,
+                              follow: int = PRIORITY_FOLLOW_DEFAULT) -> list[tuple]:
+    """稳定排序：优先级 deck 连同其后 follow 个 deck 的待渲染任务排到最前（按 manifest 顺序），
+    其余保持原序（供插队渲染——用户在某 Deck 等待时顺带把后面几个也先渲了）。"""
+    if not priority_ids:
+        return pending
+    front = _priority_front_deck_indices(manifest, priority_ids, follow)
+    if not front:
+        return pending
+    front_set = set(front)
+    # (0, di)：前部 deck 按 manifest 下标升序；其余 (1, 0) 相等 → 稳定保持原序
+    return sorted(pending, key=lambda item: (0, item[0]) if item[0] in front_set else (1, 0))
+
+
+def select_render_batch(manifest: dict, rendered_dir: Path, dpi: int, thumb_width: int,
+                        soffice: str, priority_ids: list[int] | None = None,
+                        max_render: int | None = None,
+                        priority_follow: int = PRIORITY_FOLLOW_DEFAULT) -> tuple[list[tuple], int]:
+    """构建本轮待渲染任务（跳过已就绪），按优先级排前、可选按批截断。
+
+    - priority_ids：优先渲染的 deck_id（连同其后 priority_follow 个 deck 排最前）
+    - max_render：每轮最多渲染的版本数（None=全部；watch 模式用小批让优先级能尽快插队）
+    - 被缓存清理（evicted）的版本默认不自动重渲，仅当该 Deck 被优先级请求时才重渲（并清除 evicted）
+    只把「选中」的版本标记为 rendering（未选中保持 pending）。
+    返回 (pending_jobs, 本轮之后剩余未选中版本数)。"""
+    ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
+    pri = set(priority_ids or [])
+    all_pending: list[tuple] = []
+    for di, deck in enumerate(manifest["decks"]):
+        for vi, v in enumerate(deck["versions"]):
+            if v.get("status") == STATUS_READY:
+                continue
+            if v.get("evicted") and deck.get("id") not in pri:
+                continue   # 已清理缓存：不自动重渲
+            out_dir = rendered_dir / ds_name[v["dataset_id"]] / deck["name"]
+            all_pending.append((di, vi, {
+                "file_path": v["file_path"],
+                "out_dir": str(out_dir),
+                "dpi": dpi,
+                "thumb_width": thumb_width,
+                "soffice": soffice,
+            }))
+    all_pending = order_pending_by_priority(all_pending, manifest, priority_ids,
+                                            follow=priority_follow)
+    if max_render is not None and len(all_pending) > max_render:
+        pending = all_pending[:max_render]
+    else:
+        pending = all_pending
+    remaining = len(all_pending) - len(pending)
+    for di, vi, _ in pending:
+        v = manifest["decks"][di]["versions"][vi]
+        v["status"] = STATUS_RENDERING
+        v.pop("evicted", None)   # 优先级重渲：清除缓存清理标记
+        manifest["decks"][di].pop("evicted", None)
+    return pending, remaining
+
+
+def _count_pending_versions(manifest: dict) -> int:
+    """manifest 中仍为 pending 且未被缓存清理（evicted）的版本数
+    （watch 循环据此判断是否还有活可干；evicted 只按需重渲，不占「活」）。"""
+    return sum(1 for deck in manifest["decks"] for v in deck["versions"]
+               if v.get("status") == STATUS_PENDING and not v.get("evicted"))
+
+
+def _load_status_json(meta_dir: Path) -> dict | None:
+    """读取现有 status.json（无 / 损坏返回 None）。"""
+    p = meta_dir / "status.json"
+    if not p.is_file():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _status_needs_update(old: dict | None, new: dict) -> bool:
+    """新 status 是否需要在「无渲染」路径落盘（只比较有意义字段，忽略 updated_at）。"""
+    if old is None:
+        return True
+    for k in ("active", "total", "ready", "rendering", "failed", "batch", "batch_cli"):
+        if old.get(k) != new.get(k):
+            return True
+    return False
+
+
 def run_render(
     cfg: dict,
     config_path: Path,
@@ -307,10 +562,15 @@ def run_render(
     thumb_width: int,
     soffice: str,
     active: bool,
+    max_render: int | None = None,
+    batch: int | None = None,
+    batch_cli: bool = False,
 ) -> dict:
-    """执行一次渲染 pass：合并旧状态 → 标记渲染中 → 渲染 → 逐结果更新 manifest/status。
+    """执行一次渲染 pass：合并旧状态 → 按优先级/批选择待渲染 → 渲染 → 逐结果更新 manifest/status。
 
-    输出目录跟随 config 所在目录（meta/、rendered/ 都写到所选 data 目录内）。"""
+    输出目录跟随 config 所在目录（meta/、rendered/ 都写到所选 data 目录内）。
+    max_render：每轮最多渲染的版本数（None=全部）；返回含 rendered（本轮渲染数）与
+    remaining（本轮后仍 pending 的版本数，供 watch 循环判断是否立即继续下一批）。"""
     data_dir, meta_dir, rendered_dir = _dirs_from_config(config_path, cfg)
     manifest_path = meta_dir / "manifest.json"
     manifest = build_or_merge_manifest(cfg, config_path, manifest_path, data_dir)
@@ -318,31 +578,37 @@ def run_render(
     # config 变更后清理孤儿产物（在标记渲染中之前，不会误删本轮要渲染的目录）
     _cleanup_orphan_renders(manifest, rendered_dir)
 
-    ds_name = {d["id"]: d["name"] for d in manifest["datasets"]}
-    pending: list[tuple] = []
-    for di, deck in enumerate(manifest["decks"]):
-        for vi, v in enumerate(deck["versions"]):
-            if v.get("status") == STATUS_READY:
-                continue
-            out_dir = rendered_dir / ds_name[v["dataset_id"]] / deck["name"]
-            pending.append((di, vi, {
-                "file_path": v["file_path"],
-                "out_dir": str(out_dir),
-                "dpi": dpi,
-                "thumb_width": thumb_width,
-                "soffice": soffice,
-            }))
-            v["status"] = STATUS_RENDERING
+    prefs = cfg.get("prefs") or {}
+    priority_follow = int(prefs.get("priority_follow") or PRIORITY_FOLLOW_DEFAULT)
+    cache_limit = parse_cache_limit(prefs.get("cache_limit"))
+    current_id = load_current_deck(data_dir)   # 缓存清理保护：当前查看 Deck + 其后 N 个
 
-    # 无变化（无待渲染且 manifest 与磁盘一致）→ 不写盘，保持 version 稳定。
-    # 前端固定 1s 轮询 status：version 只在真有变化时 +1，避免空转反复重读大 manifest。
+    pending, remaining = select_render_batch(
+        manifest, rendered_dir, dpi, thumb_width, soffice,
+        priority_ids=load_priority(data_dir), max_render=max_render,
+        priority_follow=priority_follow,
+    )
+
+    # 无变化（无待渲染且 manifest 与磁盘一致）→ 不重写 manifest，保持 version 稳定；
+    # 但 watch 模式仍要确保 active 标志落盘（否则上次单次渲染的 active=false 会残留，
+    # 前端误报「未以 --watch 运行」）。version 不变 → 前端不会重读大 manifest。
     old = load_existing_manifest(manifest_path)
     if not pending and old is not None and old == manifest:
-        return {"manifest": manifest, "status": build_status_from_manifest(manifest, active)}
+        if _enforce_cache_limit(manifest, rendered_dir, cache_limit, current_id):
+            # 缓存清理改变了清单 → 落盘（version 自增，前端会重读）
+            status = _persist(manifest, active, meta_dir, batch, batch_cli)
+        else:
+            status = build_status_from_manifest(manifest, active, batch, batch_cli)
+            old_status = _load_status_json(meta_dir)
+            if _status_needs_update(old_status, status):
+                meta_dir.mkdir(parents=True, exist_ok=True)
+                atomic_write_json(meta_dir / "status.json", status)   # 只更新 active 等，不 bump version
+        return {"manifest": manifest, "status": status,
+                "rendered": 0, "remaining": _count_pending_versions(manifest)}
 
     # 先落一次「渲染中」，前端可立即看到
     finalize_deck_statuses(manifest)
-    _persist(manifest, active, meta_dir)
+    _persist(manifest, active, meta_dir, batch, batch_cli)
 
     if pending:
         n = min(jobs, len(pending))
@@ -375,11 +641,15 @@ def run_render(
                 v["error"] = res.get("error", "unknown")
                 v["pages"] = []
             finalize_deck_statuses(manifest)
-            _persist(manifest, active, meta_dir)
+            _persist(manifest, active, meta_dir, batch, batch_cli)
 
     finalize_deck_statuses(manifest)
-    status = _persist(manifest, active, meta_dir)
-    return {"manifest": manifest, "status": status}
+    status = _persist(manifest, active, meta_dir, batch, batch_cli)
+    if _enforce_cache_limit(manifest, rendered_dir, cache_limit, current_id):
+        finalize_deck_statuses(manifest)
+        status = _persist(manifest, active, meta_dir, batch, batch_cli)
+    return {"manifest": manifest, "status": status,
+            "rendered": len(pending), "remaining": _count_pending_versions(manifest)}
 
 
 def _config_fingerprint(config_path: Path) -> tuple:
@@ -408,7 +678,9 @@ def _load_config_retry(config_path: Path, attempts: int = 5, delay: float = 0.2)
 def _watch_loop(args: argparse.Namespace) -> int:
     import time
 
-    print(f"[ingest] watch 模式启动（间隔 {args.interval}s，Ctrl+C 停止）")
+    cli_batch = max(0, args.batch)
+    print(f"[ingest] watch 模式启动（间隔 {args.interval}s，每批 "
+          f"{cli_batch if cli_batch else '自动(默认 8，可被 config prefs.batch 覆盖)'} 个版本，Ctrl+C 停止）")
     cfg_path = Path(args.config)
     # 配置尚不存在（launch.py --config 可指向尚未创建的 data 目录/config）：等待其出现
     if not cfg_path.is_file():
@@ -430,7 +702,16 @@ def _watch_loop(args: argparse.Namespace) -> int:
                 # 配置正在被写入：本轮跳过并保留上次成功配置；不更新 last_fp，
                 # 下一轮会重试读取——绝不用半个配置跑渲染，也就不产生半成品产物。
                 print(f"[ingest] config.json 变化但读取失败，跳过本轮: {e}")
-        run_render(cfg, cfg_path, args.jobs, args.dpi, args.thumb_width, args.soffice, active=True)
+        # 每批数量：CLI --batch 显式优先，否则取 config prefs.batch，默认 8
+        batch = cli_batch if cli_batch > 0 else int((cfg.get("prefs") or {}).get("batch") or 0)
+        if batch <= 0:
+            batch = 8
+        # 分批渲染：每批后重新读 priority.json → 用户等某 Deck 时能「插队」到最前；
+        # 还有待渲染（remaining>0）→ 不 sleep 立即下一批；全部就绪（或只剩 failed/evicted）→ 退避等待。
+        result = run_render(cfg, cfg_path, args.jobs, args.dpi, args.thumb_width, args.soffice,
+                            active=True, max_render=batch, batch=batch, batch_cli=(cli_batch > 0))
+        if result.get("remaining", 0) > 0:
+            continue
         time.sleep(args.interval)
 
 
@@ -443,6 +724,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--thumb-width", type=int, default=360, help="缩略图宽度（默认 360）")
     parser.add_argument("--soffice", default="soffice", help="soffice 可执行文件路径")
     parser.add_argument("--interval", type=float, default=5.0, help="watch 模式扫描间隔（秒）")
+    parser.add_argument("--batch", type=int, default=0,
+                        help="watch 模式每轮最多渲染的版本数（0=自动：取 config prefs.batch，默认 8）")
     parser.add_argument("--watch", action="store_true", help="持续运行（增量，检测新/改文件）")
     args = parser.parse_args(argv)
 

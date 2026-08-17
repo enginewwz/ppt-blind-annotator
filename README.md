@@ -5,13 +5,16 @@
 ## 特性
 
 - 目录授权一次，IndexedDB 记住句柄，刷新 / 重开自动恢复
-- 侧栏 Deck 列表：快速跳转、状态徽标（待处理 ● / 草稿 ● / 完成 ✓）、筛选（全部 / 待完成 / 已完成）
+- 侧栏 Deck 列表：快速跳转、状态徽标（待处理 ● / 草稿 ● / 完成 ✓）、筛选（全部 / 待完成 / 已完成）、**虚拟滚动**（数百~上千 Deck 只渲染可见窗口）
 - 标注画布：自由卡片（拖动 / 八向缩放 / 允许重叠 / 自动排列 / 1–4 列版式 / 滚轮翻页）
 - 盲测约束：不显示数据源名，仅显示「样本 N」；可选随机顺序；同步翻页
 - 保存时机：手动保存 + 切换 Deck / 关闭时自动 flush，未保存有关闭提醒
 - 数据页：Deck×数据源矩阵 / 数据源汇总，按状态**多选**筛选，增删渲染组（写 `config.json`），一键刷新
 - 清空标注（当前 / 全部）、标注导入导出、操作日志（localStorage）
 - 后端增量渲染：`ingest --watch` 监视源文件变化自动重渲，断点续跑，原子写（读写并发安全，不产生半成品 / 碎片文件）
+- **插队渲染**：点未就绪 Deck 即请求优先渲染（写 `priority.json`），`ingest --watch` 分批渲染、优先级 Deck 连同其后几个 Deck 一起排最前——跳过到某 Deck 等待时它（及后面几个）先出图
+- **缓存总量管理**：数据页侧栏设缓存上限（100M / 300M / 500M / 1G / 无限制）与每批数量；rendered/ 超出上限自动清理最旧的 Deck（标记 evicted，需重看时点它即优先重渲）
+- **报告视图**：浏览器内实时聚合（每数据源分布 / 均值 / 中位数 / 方差 / 最佳 / 最差 + 逐 Deck 明细），可**一键导出自包含静态网页 report.html**（无 CDN）；完整离线 HTML/CSV/JSON 由 `report.py` 生成
 
 ## 技术架构
 
@@ -62,8 +65,9 @@ ppt-blind-annotator/
 ├─ scripts/                   # Python 工具
 │  ├─ ingest.py               # 扫描/归组/渲染/建清单，--watch 增量
 │  ├─ render.py               # soffice→pdf→PyMuPDF→WebP（staging 提交）
+│  ├─ report.py               # 聚合标注 → reports/report.{json,csv,html}（M3）
 │  ├─ launch.py               # 一键启动：ingest --watch + 打开浏览器
-│  ├─ make_demo.py            # 生成 4 组演示 pptx
+│  ├─ make_demo.py            # 生成演示 pptx（`--count N` 可生成数百 Deck 压测）
 │  ├─ atomic.py               # 原子写（os.replace）
 │  ├─ paths.py / constants.py
 ├─ requirements.txt
@@ -103,7 +107,9 @@ ppt-blind-annotator/
 | `python -m scripts.bridge --port 8765` | 本地配置桥接（前端↔watched/config.json；一般由 launch.py 自动启动） |
 | `python -m scripts.ingest --config watched/config.json --watch` | 增量渲染，持续监视（默认即 watched） |
 | `python -m scripts.ingest --config <配置路径>` | 单次渲染后退出 |
-| `python scripts/make_demo.py` | 生成 4 组演示 pptx（methodA~D） |
+| `python -m scripts.ingest --config watched/config.json --watch` | 增量渲染，持续监视；每批数量 = `--batch` 显式值，否则取 config `prefs.batch`，默认 8 |
+| `python scripts/make_demo.py` | 生成演示 pptx（methodA~D，默认 2 Deck；`--count 200` 生成数百 Deck 压测） |
+| `python scripts/report.py` | 聚合标注生成报告 `reports/report.{json,csv,html}`（HTML 含柱状图与 `#/deck/<id>` 回链） |
 | `kill <ingest_pid>` | 停止 ingest --watch |
 
 ### 浏览器打开参数（本地可选）
@@ -153,7 +159,7 @@ data/                          # 视为「外部数据目录」——前端打�
 | M0 骨架 | 扫描 / 归组 / 建清单（manifest/status） | ✅ 已完成 |
 | M1 渲染管线 | soffice→pdf→WebP 增量渲染、断点续跑、原子写 | ✅ 已完成 |
 | M2 标注前端 | 盲测画布 + Deck 列表 + 数据页 | ✅ 已完成 |
-| M3 报告生成 | report.py 聚合输出 HTML/CSV/JSON | ⬜ 下一步 |
-| M4 性能与打包 | 虚拟滚动、千级懒加载、压测 | ⬜ 未开始 |
+| M3 报告生成 | report.py 聚合输出 HTML/CSV/JSON（含回链）；前端报告视图实时聚合 | ✅ 已完成 |
+| M4 性能与打包 | 虚拟滚动、数百级懒加载、压测、README 收尾 | ✅ 已完成（简化：数百 Deck 规模） |
 
 > 面向后续开发的详细文档（规划 / 进度 / 交接）在 `docs/.build/`（git 忽略，不入库）。

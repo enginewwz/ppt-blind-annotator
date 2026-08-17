@@ -43,6 +43,7 @@
         </div>
         <div id="deck-list" class="list"></div>
         <div id="dataset-list" class="list" hidden>
+          <div id="ds-settings"></div>
           <div class="ds-dir-bar">
             <span class="muted">目录</span>
             <button type="button" id="ds-dir-refresh" title="增量扫描备选文件夹（外部拖入新文件夹后点此刷新）">⟳ 刷新</button>
@@ -91,6 +92,7 @@
               </div>
             </div>
             <div id="columns"><div id="board"></div></div>
+            <div id="next-hint" hidden></div>
           </div>
 
           <!-- 数据集视图 -->
@@ -122,9 +124,14 @@
             <div id="ds-content"></div>
           </div>
 
-          <!-- 报告视图（M3 实现） -->
+          <!-- 报告视图（M3：实时聚合 + 引导离线 report.py；保留顶部栏目；报告视图下左侧目录隐藏→全宽） -->
           <div id="report" hidden>
-            <h2>报告</h2>
+            <div class="rep-toolbar">
+              <button type="button" id="rep-refresh" title="重新读取 manifest/标注后重算">⟳ 刷新</button>
+              <button type="button" id="rep-export" title="把当前报告导出为自包含静态网页 report.html">导出 HTML</button>
+              <span class="spacer"></span>
+              <code class="rep-cmd">python scripts/report.py</code>
+            </div>
             <div id="report-box"></div>
           </div>
 
