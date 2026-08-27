@@ -216,3 +216,17 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- PPT 盲测对照标注平台 ----
+# 本地用户数据（渲染图片、标注、报告输出、测试脚本）不入库
+# watched/ 为工作区根目录的「跟踪配置」（ingest 始终监听；启动时重置为空）
+data/
+watched/
+reports/
+tests/
+
+# 本地浏览器启动参数（launch.py 读取）
+scripts/local_browser.py
+
+# 本地测试脚本不入库
+scripts/make_demo.py

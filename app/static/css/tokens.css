@@ -1,0 +1,75 @@
+/* ============================================================
+   配色配置单（design tokens）—— 独立文件，全局唯一改主题入口
+   —— 所有颜色 / 圆角 / 阴影 / 字体都从这里改
+   —— 亮色（默认 :root）+ 深色（prefers-color-scheme: dark）
+   —— 由 app.css 顶部 `@import "tokens.css"` 引入
+   ============================================================ */
+:root {
+  /* ---- 圆角 ---- */
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+  --radius-panel: 8px;                          /* 圆角矩形面板统一 R（侧栏/工具栏/页面衬底/dock） */
+
+  /* ---- 阴影（扁平化：全部去除）---- */
+  --shadow: none;
+  --shadow-lg: none;
+
+  /* ---- 背景 ---- */
+  --bg-titlebar: #f3f4f6;                       /* 顶部标题栏 */
+  --bg-activity: #ededf0;                       /* 左侧活动栏 */
+  --bg-sidebar: #f1f4f8;                        /* 样本卡 / 侧栏衬底：统一灰、略加蓝 */
+  --bg-panel: var(--bg-sidebar);                /* 圆角矩形面板统一灰 = 样本衬底，保持同步 */
+  --bg-editor: #ffffff;                         /* 编辑器主区 / 输入框 / 弹层 */
+  --bg-hover: rgba(0, 0, 0, 0.05);              /* 悬停高亮 */
+  --bg-active: rgba(0, 122, 204, 0.12);         /* 选中 / 激活 */
+  --bg-ok-soft: rgba(26, 127, 55, 0.14);        /* 加入渲染的行底色 */
+  --bg-err-soft: rgba(207, 34, 46, 0.14);       /* 取消渲染的行底色 */
+
+  /* ---- 前景 / 文字 ---- */
+  --fg: #1f2328;                                /* 主文字 */
+  --fg-muted: #8a8f98;                          /* 次要文字 / 图标 */
+  --fg-on-accent: #ffffff;                      /* 强调/状态按钮上的文字 */
+  --img-bg: #ffffff;                            /* 幻灯片 / 大图查看底色 */
+
+  /* ---- 边框（随衬底变浅，对比度略减）---- */
+  --border: #e6e9ee;
+  --border-panel: #dde0e5;                      /* 圆角矩形面板的边框 */
+
+  /* ---- 强调色 / 状态色 ---- */
+  --accent: #007acc;                            /* 主强调（激活、选中、链接） */
+  --ok: #1a7f37;                                /* 就绪 / 最好 / 完成（绿） */
+  --warn: #9a6700;                              /* 渲染中 / 草稿（琥珀） */
+  --err: #cf222e;                               /* 失败 / 最差（红） */
+  --brown: #9c6644;                             /* 未渲染好（列表左点） */
+
+  /* ---- 遮罩 / 状态栏 ---- */
+  --overlay-backdrop: rgba(0, 0, 0, 0.45);      /* 目录授权遮罩 */
+  --lightbox-backdrop: rgba(0, 0, 0, 0.85);     /* 图片放大查看遮罩 */
+  --statusbar-muted: rgba(255, 255, 255, 0.85); /* 状态栏次要文字 */
+
+  /* ---- 字体 ---- */
+  --font-ui: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* ---- 背景 ---- */
+    --bg-titlebar: #2d2d30;
+    --bg-activity: #333337;
+    --bg-sidebar: #262a31;
+    --bg-panel: var(--bg-sidebar);
+    --bg-editor: #1e1e1e;
+    --bg-hover: rgba(255, 255, 255, 0.06);
+    --bg-active: rgba(0, 122, 204, 0.25);
+    --bg-ok-soft: rgba(46, 160, 67, 0.18);
+    --bg-err-soft: rgba(248, 81, 73, 0.18);
+
+    /* ---- 前景 / 边框 / 状态色 ---- */
+    --fg: #d4d4d4;
+    --fg-muted: #9d9d9d;
+    --border: #3d4147;
+    --border-panel: #474b52;
+    --brown: #c88f6b;   /* 深色下棕色点更亮以便辨认 */
+  }
+}

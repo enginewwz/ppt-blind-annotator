@@ -1,0 +1,5 @@
+pymupdf
+Pillow
+python-pptx
+pytest
+unoserver

@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PPT 盲测对照标注平台</title>
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="app-root">
+    <!-- 顶部：Command Center -->
+    <header id="titlebar">
+      <div class="command-center">
+        <span class="cc-logo">PPT</span>
+        <input id="quick-open" type="text" placeholder="搜索 Deck…  (Ctrl+P)" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="titlebar-actions">
+        <button id="btn-open-dir" title="选择 / 重选 data 目录">data 目录</button>
+        <button id="btn-export" title="导出标注 JSON">导出</button>
+        <button id="btn-import" title="导入标注 JSON">导入</button>
+      </div>
+    </header>
+
+    <!-- 主体：活动栏 + 侧边栏 + 编辑器区 -->
+    <div id="body">
+      <nav id="activitybar">
+        <button data-view="explorer" class="active" title="标注（Deck 列表）">标注</button>
+        <button data-view="datasets" title="数据集">数据</button>
+        <button data-view="report" title="报告">报告</button>
+      </nav>
+
+      <aside id="sidebar">
+        <div id="sidebar-header">
+          <span id="sidebar-title">Deck 列表</span>
+          <span id="sidebar-count" class="muted"></span>
+        </div>
+        <div id="deck-filter-row">
+          <select id="deck-filter" title="按完成状态过滤">
+            <option value="all">全部</option>
+            <option value="pending">待完成</option>
+            <option value="done">已完成</option>
+          </select>
+        </div>
+        <div id="deck-list" class="list"></div>
+        <div id="dataset-list" class="list" hidden>
+          <div id="ds-settings"></div>
+          <div class="ds-dir-bar">
+            <span class="muted">目录</span>
+            <button type="button" id="ds-dir-refresh" title="增量扫描备选文件夹（外部拖入新文件夹后点此刷新）">⟳ 刷新</button>
+          </div>
+          <div id="dataset-dir"></div>
+        </div>
+      </aside>
+
+      <div id="splitter" title="拖动调整目录宽度"></div>
+
+      <main id="editor">
+        <div id="tabs"></div>
+        <div id="view">
+          <!-- 标注视图 -->
+          <div id="annotate" hidden>
+            <div id="annot-toolbar">
+              <button id="btn-prev-deck" title="上一个 Deck">上一个</button>
+              <span id="annot-deck-name" class="strong"></span>
+              <button id="btn-next-deck" title="下一个 Deck">下一个</button>
+              <span class="sep"></span>
+              <button id="sync-page" class="toggle on" title="单击切换同步翻页">同步翻页</button>
+              <span id="pg-indicator" class="muted">- / -</span>
+              <button id="shuffle" class="toggle" title="单击切换乱序">乱序</button>
+              <button id="overlap" class="toggle" title="允许重叠">允许重叠</button>
+              <button id="auto-arrange" class="toggle" title="单击排一遍；双击开启连续自动排列">自动排列</button>
+              <span class="sep"></span>
+              <span class="muted" title="滚轮翻页；按住 空格+滚轮 上下滚动卡片流">滚轮翻页</span>
+              <span class="sep"></span>
+              <span class="muted">布局</span>
+              <div class="seg" id="layout-seg">
+                <button data-cols="1" title="每行 1 列"><svg width="16" height="12" viewBox="0 0 16 12"><rect x="1" y="1" width="14" height="10" rx="1.5" fill="currentColor"/></svg></button>
+                <button data-cols="2" title="每行 2 列"><svg width="16" height="12" viewBox="0 0 16 12"><rect x="1" y="1" width="6" height="10" rx="1" fill="currentColor"/><rect x="9" y="1" width="6" height="10" rx="1" fill="currentColor"/></svg></button>
+                <button data-cols="3" title="每行 3 列"><svg width="16" height="12" viewBox="0 0 16 12"><rect x="1" y="1" width="4" height="10" rx="1" fill="currentColor"/><rect x="6" y="1" width="4" height="10" rx="1" fill="currentColor"/><rect x="11" y="1" width="4" height="10" rx="1" fill="currentColor"/></svg></button>
+                <button data-cols="4" title="每行 4 列"><svg width="16" height="12" viewBox="0 0 16 12"><rect x="1" y="1" width="3" height="10" rx="0.8" fill="currentColor"/><rect x="5" y="1" width="3" height="10" rx="0.8" fill="currentColor"/><rect x="9" y="1" width="3" height="10" rx="0.8" fill="currentColor"/><rect x="13" y="1" width="3" height="10" rx="0.8" fill="currentColor"/></svg></button>
+              </div>
+              <span class="spacer"></span>
+              <span id="annot-saved" class="muted"></span>
+              <button id="btn-save-draft">保存草稿</button>
+              <button id="btn-submit" class="primary">提交</button>
+              <div class="clear-wrap">
+                <button id="btn-clear" title="清空标注与历史">清空</button>
+                <div id="clear-menu" class="menu" hidden>
+                  <button data-scope="current">清空当前 Deck</button>
+                  <button data-scope="all">清空全部 Deck</button>
+                </div>
+              </div>
+            </div>
+            <div id="columns"><div id="board"></div></div>
+            <div id="next-hint" hidden></div>
+          </div>
+
+          <!-- 数据集视图 -->
+          <div id="datasets" hidden>
+            <div class="ds-toolbar">
+              <label class="ds-ctl">纵轴
+                <span class="sel-wrap">
+                  <select id="ds-axis">
+                    <option value="deck">Deck</option>
+                    <option value="dataset">数据源</option>
+                  </select>
+                </span>
+              </label>
+              <div class="ms-wrap" id="ds-status-ms">
+                <button type="button" class="ms-btn" id="ds-status-btn">状态：全部</button>
+                <div class="ms-panel" hidden>
+                  <label><input type="checkbox" data-st="all" checked> 全部</label>
+                  <label><input type="checkbox" data-st="ready"> 就绪</label>
+                  <label><input type="checkbox" data-st="rendering"> 渲染中</label>
+                  <label><input type="checkbox" data-st="pending"> 待处理</label>
+                  <label><input type="checkbox" data-st="failed"> 失败</label>
+                </div>
+              </div>
+              <button type="button" id="ds-refresh" title="重新加载 manifest/状态（如添加数据源后）">⟳ 刷新</button>
+              <span class="sep"></span>
+              <button type="button" id="ds-import" title="把当前 data 目录的 config 复制到工作区 config（ingest 始终监听工作区 config；需 launch.py 启动）">⇥ 复制到工作区</button>
+              <button type="button" id="ds-export" title="把工作区 config 写回当前 data 目录的 config.json">⇤ 写回目录</button>
+            </div>
+            <div id="ds-content"></div>
+          </div>
+
+          <!-- 报告视图：实时聚合 + 引导离线 report.py；报告视图下左侧目录隐藏→全宽 -->
+          <div id="report" hidden>
+            <div class="rep-toolbar">
+              <button type="button" id="rep-refresh" title="重新读取 manifest/标注后重算">⟳ 刷新</button>
+              <button type="button" id="rep-export" title="把当前报告导出为自包含静态网页 report.html">导出 HTML</button>
+              <span class="spacer"></span>
+              <code class="rep-cmd">python scripts/report.py</code>
+            </div>
+            <div id="report-box"></div>
+          </div>
+
+          <!-- 空状态 -->
+          <div id="empty-state" class="empty" hidden>
+            <p>从左侧选择一个已就绪的 Deck 开始标注。</p>
+            <p class="muted">尚未有数据？请运行 <code>python scripts/launch.py</code> 或 <code>python -m scripts.ingest --watch</code>。</p>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- 底部状态栏 -->
+    <footer id="statusbar">
+      <span id="sb-deck"></span>
+      <span id="sb-annot"></span>
+      <span id="sb-fs" class="muted"></span>
+      <span id="sb-progress" class="right"></span>
+    </footer>
+
+    <!-- 授权覆盖层：默认隐藏，仅首次使用（未保存路径）时显示 -->
+    <div id="overlay" hidden>
+      <div id="overlay-box">
+        <h2>选择 data 目录</h2>
+        <p class="muted">需要授权访问项目的 <code>data/</code> 目录（一次即可，浏览器会记住；之后自动恢复）。</p>
+        <button id="btn-pick-dir" class="primary">选择 data 目录…</button>
+        <p id="overlay-error" class="error" hidden></p>
+      </div>
+    </div>
+
+    <!-- 图片放大查看器（点击 PPT 图片弹出，点击/按 Esc 关闭） -->
+    <div id="lightbox" hidden>
+      <img id="lightbox-img" alt="PPT 原图">
+    </div>
+  </div>
+
+  <script src="js/fsaccess.js"></script>
+  <script src="js/explorer.js"></script>
+  <script src="js/annotate.js"></script>
+  <script src="js/report.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
