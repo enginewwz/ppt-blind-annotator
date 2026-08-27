@@ -117,13 +117,20 @@ def main(argv: list[str] | None = None) -> int:
     # 且不再产生需要单独 kill 的子进程（Windows 上子进程可能静默退出导致 PID 找不到）。
     bridge_port = args.bridge_port
     if bridge_port > 0:
-        try:
-            bridge_server = create_server(bridge_port)
-            threading.Thread(target=bridge_server.serve_forever, daemon=True).start()
-            print(f"[launch] 本地桥接 http://127.0.0.1:{bridge_port}/config（前端 ?bridge={bridge_port}）")
-        except OSError as e:
-            print(f"[launch] 桥接启动失败：端口 {bridge_port} 可能被占用（请先停止旧的 launch/桥接）→ {e}")
-            bridge_port = 0
+        # WSL/镜像网络下 Windows 侧可能占用默认端口（如 VS Code 自身等）→ 顺次尝试后续端口，
+        # 前端由桥接同源伺服（location.origin），端口变化对页面完全透明。
+        for p in range(bridge_port, bridge_port + 10):
+            try:
+                bridge_server = create_server(p)
+                threading.Thread(target=bridge_server.serve_forever, daemon=True).start()
+                bridge_port = p
+                print(f"[launch] 本地桥接 http://127.0.0.1:{bridge_port}/config（前端 ?bridge={bridge_port}）")
+                break
+            except OSError:
+                bridge_port = 0  # 当前端口被占用 → 试下一个
+        if bridge_port == 0:
+            print(f"[launch] 桥接启动失败：端口 {args.bridge_port}~{args.bridge_port + 9} 均被占用"
+                  f"（请先停止旧的 launch/桥接）→ 已禁用桥接，退回 file:// 直开前端")
 
     cfg = Path(args.config) if args.config else paths.WATCH_CONFIG_PATH
     # 默认（未显式 --config）：使用工作区根目录的「跟踪配置」watched/config.json。

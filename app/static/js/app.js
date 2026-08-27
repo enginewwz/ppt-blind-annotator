@@ -145,9 +145,11 @@ const Datasets = {
             localStorage.setItem("ppt.containerAbs", this.containerAbs);
           } catch (_) { /* ignore */ }
           const entries = await FS.listDir(this.containerRel);
-          for (const e of entries)
-            if (e.kind === "directory")
-              addCand(e.name, this.containerRel ? this.containerRel + "/" + e.name : e.name);
+          for (const e of entries) {
+            if (e.kind !== "directory") continue;
+            if (e.name === "meta" || e.name === "rendered") continue;  // 书签/输出目录不当备选（与全树扫描一致）
+            addCand(e.name, this.containerRel ? this.containerRel + "/" + e.name : e.name);
+          }
         }
       } catch (_) { /* ignore */ }
     }
